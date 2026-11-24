@@ -2324,6 +2324,9 @@ mod tests;
 mod authz;
 
 #[cfg(test)]
+mod auth_matrix;
+
+#[cfg(test)]
 mod props;
 
 // TTL chaos harness demo: drives randomized ledger gaps through the
