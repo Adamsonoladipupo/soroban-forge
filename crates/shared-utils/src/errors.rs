@@ -58,4 +58,9 @@ pub enum ForgeError {
     /// A proposer has reached the maximum allowed concurrent active proposals
     /// or is within the proposer cooldown window.
     ProposerCooldown = 15,
+    /// The operation requires the entity to be in a specific lifecycle state,
+    /// but the entity is in an incompatible state (e.g. a vote revision on a
+    /// non-Active proposal). Kept distinct from [`ForgeError::InvalidInput`]
+    /// so callers can distinguish wrong-state errors from wrong-argument errors.
+    InvalidState = 16,
 }
