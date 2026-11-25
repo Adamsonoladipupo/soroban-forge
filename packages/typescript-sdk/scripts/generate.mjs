@@ -102,20 +102,32 @@ for (const contract of contracts) {
   }
 
   const clientClass = "export class Client extends ContractClient {";
-  const generatedText = readFileSync(generatedSource, "utf8").replace(
+  const interfaceDecl = "export interface Client {";
+  const specMember = "  readonly spec: ContractSpec;";
+  const txFromJsonMember = "  txFromJSON<T = unknown>(json: string): AssembledTransaction<T>;";
+
+  let generatedText = readFileSync(generatedSource, "utf8").replace(
     /[ \t]+(?=\r?$)/gm,
     "",
   );
   if (!generatedText.includes(clientClass)) {
     throw new Error(`Expected generated Client class in ${generatedSource}`);
   }
-  writeFileSync(
-    generatedSource,
-    generatedText.replace(
+
+  // Newer stellar-cli (v27+) already emits `export interface Client { … }` with
+  // all method signatures. The spec and txFromJSON members live on ContractClient
+  // and are inherited by the class — injecting them again into the generated
+  // interface creates a property-vs-method conflict. Only prepend the full
+  // interface block when the CLI did NOT emit one (older output).
+  const alreadyHasInterface = generatedText.includes(interfaceDecl);
+  if (!alreadyHasInterface) {
+    generatedText = generatedText.replace(
       clientClass,
-      `export interface Client {\n  readonly spec: ContractSpec;\n  txFromJSON<T = unknown>(json: string): AssembledTransaction<T>;\n}\n${clientClass}`,
-    ),
-  );
+      `${interfaceDecl}\n${specMember}\n${txFromJsonMember}\n}\n${clientClass}`,
+    );
+  }
+
+  writeFileSync(generatedSource, generatedText);
   cpSync(generatedSource, join(sdkClientsDir, `${contract.module}.ts`));
 
   if (contract.package) {

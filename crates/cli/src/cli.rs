@@ -131,3 +131,48 @@ pub struct DoctorArgs {
     #[arg(long, value_name = "PATH")]
     pub wasm: Option<PathBuf>,
 }
+
+#[derive(Args, Debug, Clone)]
+pub struct PlanArgs {
+    /// Path to the plan JSON file to execute.
+    #[arg(value_name = "PLAN")]
+    pub plan: PathBuf,
+    /// Preview the plan without executing it; writes a `.dryrun.json` report.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    /// Execute without an interactive confirmation prompt.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+    /// Write a JSON execution receipt to this path instead of `<plan>.receipt.json`.
+    #[arg(long, value_name = "PATH")]
+    pub receipt: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TtlAuditArgs {
+    /// Contract ID to audit.
+    #[arg(long)]
+    pub contract: String,
+    /// Network profile to use (e.g. `testnet`, `mainnet`).
+    #[arg(long, default_value = "testnet")]
+    pub network: String,
+    /// JSON file listing persistent storage key specifications to audit.
+    #[arg(long, value_name = "FILE")]
+    pub keys: Option<PathBuf>,
+    /// Minimum remaining TTL in ledgers; entries below this value are flagged.
+    #[arg(long, default_value_t = 100_000)]
+    pub threshold: u32,
+    /// Output format.
+    #[arg(long, value_name = "FORMAT", default_value = "table")]
+    pub format: OutputFormat,
+    /// Write an extend-TTL plan JSON file to this path for all expiring entries.
+    #[arg(long, value_name = "FILE")]
+    pub plan: Option<PathBuf>,
+}
+
+/// Output format selection.
+#[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    Table,
+    Json,
+}

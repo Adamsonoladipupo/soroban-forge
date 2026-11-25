@@ -18,7 +18,7 @@ mod commands;
 use clap::{Parser, Subcommand};
 use cli::{
     BuildArgs, DeployArgs, DoctorArgs, EventsArgs, InspectArgs, InvokeArgs, LintArgs, NewArgs,
-    ScaffoldValidateArgs, TestArgs, VerifyArgs,
+    PlanArgs, ScaffoldValidateArgs, TestArgs, TtlAuditArgs, VerifyArgs,
 };
 
 #[derive(Parser, Debug)]
@@ -46,6 +46,8 @@ pub enum Commands {
     Events(EventsArgs),
     Inspect(InspectArgs),
     Doctor(DoctorArgs),
+    Plan(PlanArgs),
+    TtlAudit(TtlAuditArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -64,6 +66,13 @@ fn main() -> anyhow::Result<()> {
         Commands::Events(args) => commands::events::run(args)?,
         Commands::Inspect(args) => commands::inspect::run(args)?,
         Commands::Doctor(args) => commands::doctor::run(args)?,
+        Commands::Plan(args) => commands::plan::run(args)?,
+        Commands::TtlAudit(args) => {
+            let exit_code = commands::ttl_audit::run(args)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
     }
 
     Ok(())
