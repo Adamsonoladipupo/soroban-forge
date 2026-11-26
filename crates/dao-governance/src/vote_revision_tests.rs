@@ -445,7 +445,8 @@ fn revise_on_cancelled_proposal_returns_invalid_state() {
         &soroban_sdk::Vec::new(&env),
         &None,
     );
-    client.vote(&id, &accounts.user2, &true);
+    // A proposal can only be cancelled before any vote is cast, so the
+    // revision attempt hits the state check before the missing-vote check.
     client.cancel_proposal(&id, &accounts.user1);
 
     let res = client.try_revise_vote(&id, &accounts.user2, &false);
