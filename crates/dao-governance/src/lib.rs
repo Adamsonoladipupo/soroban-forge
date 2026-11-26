@@ -110,7 +110,8 @@
 //!   self-authorization covers the outgoing transfer.
 //! - `cancel_proposal` requires the original proposer and freezes a
 //!   not-yet-executed proposal; the refund runs in that same call.
-//! - `get_proposal` and `get_bond_config` are read-only views.
+//! - `get_proposal`, `get_proposal_status`, and `get_bond_config` are read-only
+//!   views.
 //!
 //! The `Queued` state is reserved for an optional timelock that lands in a
 //! follow-up; it is not reachable through the current public interface.
@@ -127,11 +128,6 @@ use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Bytes,
     Env, IntoVal, Map, Symbol, Val,
 };
-
-#[contractclient(name = "SupplyTokenClient")]
-pub trait SupplyToken {
-    fn total_supply(env: Env) -> i128;
-}
 
 /// Public interface for the Soroban Forge DAO governance contract.
 #[contractclient(name = "SorobanForgeDaoGovernanceClient")]
@@ -282,6 +278,12 @@ pub trait SorobanForgeDaoGovernance {
         proposal_id: u64,
     ) -> Result<Proposal, soroban_forge_shared_utils::ForgeError>;
 
+    /// Read a read-only proposal status summary (read-only view).
+    fn get_proposal_status(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ProposalStatus, soroban_forge_shared_utils::ForgeError>;
+
     /// Return the total number of proposals created (read-only view).
     fn get_proposal_count(env: Env) -> u64;
 
@@ -299,6 +301,49 @@ pub trait SorobanForgeDaoGovernance {
         voter: Address,
     ) -> Result<bool, soroban_forge_shared_utils::ForgeError>;
 
+    /// Read the exact vote direction and recorded weight for a voter.
+    ///
+    /// Returns [`ForgeError::NotFound`] for an unknown proposal. A well-formed
+    /// address that has not voted yields a no-vote receipt.
+    fn get_vote_receipt(
+        env: Env,
+        proposal_id: u64,
+        voter: Address,
+    ) -> Result<VoteReceipt, soroban_forge_shared_utils::ForgeError>;
+
+    /// Read the proposal-level snapshot metadata (snapshot ledger sequence and
+    /// ledger timestamp recorded when the proposal was created).
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no proposal with this id.
+    fn get_proposal_snapshot(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ProposalSnapshot, soroban_forge_shared_utils::ForgeError>;
+
+    /// Read the vote-power snapshot for `voter` on `proposal_id`, including
+    /// the snapshot ledger sequence, timestamp, and recorded voter weight.
+    ///
+    /// Returns zero weight (`has_voted: false`, `weight: 0`) for an address
+    /// that has not voted on the proposal, and [`ForgeError::NotFound`] for an
+    /// unknown proposal id.
+    fn get_vote_snapshot(
+        env: Env,
+        proposal_id: u64,
+        voter: Address,
+    ) -> Result<VoteSnapshot, soroban_forge_shared_utils::ForgeError>;
+
+    /// Read the recorded voting weight for `voter` on `proposal_id`.
+    ///
+    /// Returns `Ok(0)` when `voter` has not voted on `proposal_id`, and
+    /// [`ForgeError::NotFound`] for an unknown proposal id.
+    fn get_voter_weight(
+        env: Env,
+        proposal_id: u64,
+        voter: Address,
+    ) -> Result<i128, soroban_forge_shared_utils::ForgeError>;
+
     /// Permissionless keeper entrypoint: extend the persistent storage TTL of a proposal.
     ///
     /// # Errors
@@ -308,15 +353,55 @@ pub trait SorobanForgeDaoGovernance {
 
     /// Read how many active proposals `proposer` currently has in flight (read-only view).
     fn get_active_proposal_count(env: Env, proposer: Address) -> u32;
+}
 
-    /// Configure the minimum participation quorum percentage (in basis points, where 10000 = 100%).
-    ///
-    /// Requires deployer/governance authorization.
-    ///
-    /// # Errors
-    ///
-    /// * [`ForgeError::InvalidInput`] — `quorum_bps > 10000`.
-    fn set_quorum(env: Env, quorum_bps: u32) -> Result<(), soroban_forge_shared_utils::ForgeError>;
+/// Immutable receipt for a single proposal vote.
+///
+/// `support` and `weight` are the values recorded at vote time. They are never
+/// recalculated from the voter's current token balance.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoteReceipt {
+    /// Whether this voter cast a vote on the proposal.
+    pub has_voted: bool,
+    /// Recorded direction: `Some(true)` for, `Some(false)` against.
+    /// `None` means no vote was recorded. Abstain is not supported by `vote`.
+    pub support: Option<bool>,
+    /// Governance-token balance recorded when the vote was cast.
+    pub weight: i128,
+}
+
+/// Snapshot ledger sequence and timestamp recorded for a proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalSnapshot {
+    /// Proposal identifier.
+    pub proposal_id: u64,
+    /// Ledger sequence number at which the proposal was created.
+    pub snapshot_ledger: u32,
+    /// Ledger timestamp at which the proposal was created.
+    pub snapshot_timestamp: u64,
+}
+
+/// Read-only vote-power snapshot for a voter on a proposal.
+///
+/// Exposes the snapshot ledger and timestamp alongside the immutable weight
+/// recorded when the vote was cast (or `0` when the address has not voted).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoteSnapshot {
+    /// Proposal identifier.
+    pub proposal_id: u64,
+    /// Whether this voter cast a vote on the proposal.
+    pub has_voted: bool,
+    /// Recorded vote direction (`Some(true)` for, `Some(false)` against, `None` if not voted).
+    pub support: Option<bool>,
+    /// Recorded voting weight (`0` for non-voters).
+    pub weight: i128,
+    /// Ledger sequence when the snapshot was recorded.
+    pub snapshot_ledger: u32,
+    /// Ledger timestamp when the snapshot was recorded.
+    pub snapshot_timestamp: u64,
 }
 
 /// Lifecycle state of a governance proposal.
@@ -351,9 +436,6 @@ pub enum BondState {
     /// (terminal).
     Forfeited,
 }
-
-#[contract]
-pub struct MockTarget;
 
 /// The one-time proposal-bond configuration.
 ///
@@ -417,6 +499,32 @@ pub struct DependencyView {
     pub conflicts_with: Option<u64>,
 }
 
+/// A read-only summary of a proposal's readiness state.
+///
+/// Returned by [`SorobanForgeDaoGovernance::get_proposal_status`].
+/// Distinguishes executable, retryable, expired, rejected, and terminal
+/// states where applicable.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalStatus {
+    /// Tally of "against" votes in governance-token units.
+    pub against_votes: i128,
+    /// Tally of "for" votes in governance-token units.
+    pub for_votes: i128,
+    /// Whether the proposal can be executed now (i.e. `Succeeded` with
+    /// dependencies met and voting deadline passed).
+    pub is_executable: bool,
+    /// Whether the proposal is in a retryable state (e.g. `Succeeded` whose
+    /// target invocation previously failed; bond still in custody).
+    pub is_retryable: bool,
+    /// Unique proposal identifier.
+    pub proposal_id: u64,
+    /// Current lifecycle state of the proposal.
+    pub state: ProposalState,
+    /// Ledger timestamp at which voting closes (0 if proposal is not `Active`).
+    pub voting_ends: u64,
+}
+
 /// Bump a persistent entry's TTL to the workspace policy's 30-day horizon
 /// when it falls inside its one-day threshold — see
 /// `soroban_forge_shared_utils::ttl`.
@@ -447,8 +555,15 @@ enum DataKey {
     GovernanceToken,
     /// Number of concurrent active proposals currently in flight for a proposer.
     ActiveProposalCount(Address),
-    /// Minimum participation quorum percentage in basis points (instance storage).
-    Quorum,
+    /// Exact direction and weight recorded for a voter's receipt.
+    ///
+    /// Appended last so existing `DataKey` discriminants stay unchanged for
+    /// contracts upgraded from a version without receipts.
+    VoteReceipt(u64, Address),
+    /// Ledger sequence and timestamp recorded when `proposal_id` was created.
+    ProposalSnapshot(u64),
+    /// Ledger sequence and timestamp recorded when `voter` cast a vote on `proposal_id`.
+    VoteSnapshot(u64, Address),
 }
 
 /// Maximum number of concurrent active proposals a single proposer may have by default.
@@ -500,20 +615,6 @@ impl DaoGovernance {
             },
         );
         env.storage().instance().set(&DataKey::BondHeld, &0i128);
-        Ok(())
-    }
-
-    /// Configure the minimum participation quorum percentage (in basis points, where 10000 = 100%).
-    ///
-    /// Validates that `quorum_bps <= 10000`. Emits a `QuorumUpdated` event.
-    pub fn set_quorum(env: Env, quorum_bps: u32) -> Result<(), ForgeError> {
-        if quorum_bps > 10000 {
-            return Err(ForgeError::InvalidInput);
-        }
-        let storage = env.storage().instance();
-        let old_quorum_bps: u32 = storage.get(&DataKey::Quorum).unwrap_or(0);
-        storage.set(&DataKey::Quorum, &quorum_bps);
-        events::quorum_updated(&env, old_quorum_bps, quorum_bps);
         Ok(())
     }
 
@@ -594,6 +695,14 @@ impl DaoGovernance {
         env.storage().instance().set(&DataKey::Count, &proposal_id);
         env.storage().persistent().set(&key, &proposal);
         bump_entry(&env, &key);
+        env.storage().instance().set(
+            &DataKey::ProposalSnapshot(proposal_id),
+            &ProposalSnapshot {
+                proposal_id,
+                snapshot_ledger: env.ledger().sequence(),
+                snapshot_timestamp: env.ledger().timestamp(),
+            },
+        );
         env.storage().instance().set(&DataKey::BondHeld, &next_held);
         Self::inc_active_proposals(&env, &proposer)?;
         events::proposed(&env, &proposal);
@@ -707,6 +816,18 @@ impl DaoGovernance {
         }
         let key = DataKey::Proposal(proposal_id);
         env.storage().instance().set(&vote_key, &true);
+        env.storage().instance().set(
+            &DataKey::VoteReceipt(proposal_id, voter.clone()),
+            &VoteReceipt {
+                has_voted: true,
+                support: Some(support),
+                weight,
+            },
+        );
+        env.storage().instance().set(
+            &DataKey::VoteSnapshot(proposal_id, voter.clone()),
+            &(env.ledger().sequence(), env.ledger().timestamp()),
+        );
         env.storage().persistent().set(&key, &proposal);
         bump_entry(&env, &key);
         events::vote_cast(&env, proposal_id, &voter, support, weight);
@@ -744,38 +865,7 @@ impl DaoGovernance {
         match proposal.state {
             ProposalState::Active => {
                 let key = DataKey::Proposal(proposal_id);
-
-                // Query governance token total supply and quorum configuration
-                let governance_token: Address = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::GovernanceToken)
-                    .ok_or(ForgeError::NotInitialized)?;
-                let total_supply = match env.try_invoke_contract::<i128, soroban_sdk::Error>(
-                    &governance_token,
-                    &Symbol::new(&env, "total_supply"),
-                    soroban_sdk::vec![&env],
-                ) {
-                    Ok(Ok(supply)) => supply,
-                    _ => 0, // Fallback if token contract does not implement total_supply
-                };
-                let quorum_bps: u32 = env.storage().instance().get(&DataKey::Quorum).unwrap_or(0);
-
-                let total_votes = proposal
-                    .for_votes
-                    .checked_add(proposal.against_votes)
-                    .ok_or(ForgeError::ArithmeticOverflow)?;
-
-                let required_votes = total_supply
-                    .checked_mul(quorum_bps as i128)
-                    .ok_or(ForgeError::ArithmeticOverflow)?
-                    .checked_div(10000)
-                    .ok_or(ForgeError::ArithmeticOverflow)?;
-
-                let has_majority = proposal.for_votes > proposal.against_votes;
-                let meets_quorum = total_votes >= required_votes;
-
-                if has_majority && meets_quorum {
+                if proposal.for_votes > proposal.against_votes {
                     proposal.state = ProposalState::Succeeded;
                     env.storage().persistent().set(&key, &proposal);
                     bump_entry(&env, &key);
@@ -788,8 +878,9 @@ impl DaoGovernance {
                     );
                     Ok(())
                 } else {
-                    // Defeat: either lacked majority or failed quorum threshold.
-                    // Forfeit the bond to the treasury.
+                    // Defeat: forfeit the bond to the treasury. Custody
+                    // arithmetic and the transfer both run before the state
+                    // write, so a failure leaves the proposal `Active`.
                     let bond = Self::bond_config_impl(&env)?;
                     let next_held = Self::bond_held(&env)
                         .checked_sub(proposal.bond_amount)
@@ -948,6 +1039,35 @@ impl DaoGovernance {
         Self::get_proposal_impl(&env, proposal_id)
     }
 
+    /// Read a read-only proposal status summary (read-only view).
+    ///
+    /// Pure view: never writes storage, extends TTLs, or emits events. An
+    /// unknown proposal yields [`ForgeError::NotFound`]. A `Succeeded`
+    /// proposal is executable once voting has closed and all dependencies
+    /// are satisfied; it stays retryable while its bond is still in custody
+    /// and no dependency has permanently blocked execution.
+    pub fn get_proposal_status(env: Env, proposal_id: u64) -> Result<ProposalStatus, ForgeError> {
+        let proposal = Self::get_proposal_impl(&env, proposal_id)?;
+        let dependency_check = Self::check_dependencies(&env, &proposal);
+        let succeeded = proposal.state == ProposalState::Succeeded;
+        let active = proposal.state == ProposalState::Active;
+        let deadline_passed = env.ledger().timestamp() >= proposal.voting_ends;
+        let dependencies_met = dependency_check.is_ok();
+        let dependencies_recoverable =
+            matches!(dependency_check, Ok(()) | Err(ForgeError::DeadlineReached));
+        Ok(ProposalStatus {
+            against_votes: proposal.against_votes,
+            for_votes: proposal.for_votes,
+            is_executable: succeeded && deadline_passed && dependencies_met,
+            is_retryable: succeeded
+                && proposal.bond_state == BondState::Posted
+                && dependencies_recoverable,
+            proposal_id: proposal.proposal_id,
+            state: proposal.state,
+            voting_ends: if active { proposal.voting_ends } else { 0 },
+        })
+    }
+
     /// Return a proposal's dependency edges for indexers.
     pub fn get_dependencies(env: Env, proposal_id: u64) -> Result<DependencyView, ForgeError> {
         let proposal = Self::get_proposal_impl(&env, proposal_id)?;
@@ -998,13 +1118,125 @@ impl DaoGovernance {
         Ok(proposals)
     }
 
+    /// Read the immutable vote receipt recorded for `voter` on `proposal_id`.
+    ///
+    /// This is a read-only view: it never writes storage, extends TTLs, or
+    /// recalculates voting power. A voter that has not voted receives
+    /// `has_voted: false`, `support: None`, and `weight: 0`. A malformed
+    /// `voter` address is rejected by the Soroban host before this query runs
+    /// (the shared error registry documents bad addresses as `InvalidInput`).
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no proposal with this id.
+    pub fn get_vote_receipt(
+        env: Env,
+        proposal_id: u64,
+        voter: Address,
+    ) -> Result<VoteReceipt, ForgeError> {
+        // Verify the proposal exists; this is a pure read.
+        Self::get_proposal_impl(&env, proposal_id)?;
+        let key = DataKey::VoteReceipt(proposal_id, voter);
+        Ok(env.storage().instance().get(&key).unwrap_or(VoteReceipt {
+            has_voted: false,
+            support: None,
+            weight: 0,
+        }))
+    }
+
+    /// Read the proposal-level snapshot metadata (snapshot ledger sequence and
+    /// timestamp recorded when `proposal_id` was created).
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no proposal with this id.
+    pub fn get_proposal_snapshot(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ProposalSnapshot, ForgeError> {
+        Self::proposal_snapshot_impl(&env, proposal_id)
+    }
+
+    /// Read the vote-power snapshot for `voter` on `proposal_id` (read-only view).
+    ///
+    /// Exposes the snapshot ledger sequence, timestamp, and immutable recorded
+    /// weight. For a non-voter on an existing proposal, returns `has_voted: false`,
+    /// `support: None`, `weight: 0`, and the proposal's creation snapshot ledger
+    /// and timestamp. Returns [`ForgeError::NotFound`] for an unknown proposal.
+    pub fn get_vote_snapshot(
+        env: Env,
+        proposal_id: u64,
+        voter: Address,
+    ) -> Result<VoteSnapshot, ForgeError> {
+        let proposal_snapshot = Self::proposal_snapshot_impl(&env, proposal_id)?;
+        let receipt: VoteReceipt = env
+            .storage()
+            .instance()
+            .get(&DataKey::VoteReceipt(proposal_id, voter.clone()))
+            .unwrap_or(VoteReceipt {
+                has_voted: false,
+                support: None,
+                weight: 0,
+            });
+        let (snapshot_ledger, snapshot_timestamp) = if receipt.has_voted {
+            env.storage()
+                .instance()
+                .get(&DataKey::VoteSnapshot(proposal_id, voter))
+                .unwrap_or((
+                    proposal_snapshot.snapshot_ledger,
+                    proposal_snapshot.snapshot_timestamp,
+                ))
+        } else {
+            (
+                proposal_snapshot.snapshot_ledger,
+                proposal_snapshot.snapshot_timestamp,
+            )
+        };
+        Ok(VoteSnapshot {
+            proposal_id,
+            has_voted: receipt.has_voted,
+            support: receipt.support,
+            weight: receipt.weight,
+            snapshot_ledger,
+            snapshot_timestamp,
+        })
+    }
+
+    /// Read the recorded voting weight for `voter` on `proposal_id` (read-only view).
+    ///
+    /// Returns `Ok(0)` for an address that has not voted on the proposal, and
+    /// [`ForgeError::NotFound`] for an unknown proposal id.
+    pub fn get_voter_weight(
+        env: Env,
+        proposal_id: u64,
+        voter: Address,
+    ) -> Result<i128, ForgeError> {
+        Self::get_proposal_impl(&env, proposal_id)?;
+        let receipt: Option<VoteReceipt> = env
+            .storage()
+            .instance()
+            .get(&DataKey::VoteReceipt(proposal_id, voter));
+        Ok(receipt.map_or(0, |r| r.weight))
+    }
+
+    fn proposal_snapshot_impl(env: &Env, proposal_id: u64) -> Result<ProposalSnapshot, ForgeError> {
+        Self::get_proposal_impl(env, proposal_id)?;
+        Ok(env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalSnapshot(proposal_id))
+            .unwrap_or(ProposalSnapshot {
+                proposal_id,
+                snapshot_ledger: 0,
+                snapshot_timestamp: 0,
+            }))
+    }
+
     /// Check whether `voter` has voted on `proposal_id` (read-only view).
     ///
-    /// Returns `ForgeError::NotFound` if `proposal_id` does not exist.
+    /// Returns [`ForgeError::NotFound`] if `proposal_id` does not exist.
     pub fn has_voted(env: Env, proposal_id: u64, voter: Address) -> Result<bool, ForgeError> {
-        // Verify proposal existence
         Self::get_proposal_impl(&env, proposal_id)?;
-
         let vote_key = DataKey::Vote(proposal_id, voter);
         Ok(env.storage().instance().has(&vote_key))
     }
@@ -1185,20 +1417,6 @@ mod events {
         pub forfeited: bool,
     }
 
-    #[contractevent]
-    pub struct QuorumUpdated {
-        pub old_quorum_bps: u32,
-        pub new_quorum_bps: u32,
-    }
-
-    pub fn quorum_updated(env: &Env, old_quorum_bps: u32, new_quorum_bps: u32) {
-        QuorumUpdated {
-            old_quorum_bps,
-            new_quorum_bps,
-        }
-        .publish(env);
-    }
-
     pub fn proposed(env: &Env, proposal: &Proposal) {
         Proposed {
             proposal_id: proposal.proposal_id,
@@ -1262,10 +1480,17 @@ mod events {
 }
 
 #[cfg(test)]
+mod resource_report;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_forge_test_utils::{MockTarget, MockTargetClient, TestAccounts};
-    use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
+
+    use soroban_forge_test_utils::{FailureSchedule, MockTarget, MockTargetClient, TestAccounts};
+    use soroban_sdk::testutils::{
+        storage::Instance as _, storage::Persistent as _, Address as _, Events as _, Ledger as _,
+    };
+
     use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
     use soroban_sdk::{Bytes, Env};
 
@@ -1275,35 +1500,6 @@ mod tests {
     const BOND: i128 = 100;
     /// Starting balance minted to each account that proposes in a test.
     const FUNDS: i128 = 10_000;
-
-    #[contract]
-    pub struct MockTokenContract;
-
-    #[contractimpl]
-    impl MockTokenContract {
-        pub fn balance(_env: Env, _id: Address) -> i128 {
-            10_000
-        }
-        pub fn total_supply(_env: Env) -> i128 {
-            100_000 // e.g., 100k total supply, so 10k votes is only 10% (< 90% quorum)
-        }
-    }
-
-    #[contract]
-    pub struct QuorumMockToken;
-
-    #[contractimpl]
-    impl QuorumMockToken {
-        pub fn balance(_env: Env, _id: Address) -> i128 {
-            10_000
-        }
-        pub fn total_supply(_env: Env) -> i128 {
-            100_000
-        }
-        pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {
-            // Mock transfer does nothing
-        }
-    }
 
     /// Fresh env with a real Stellar Asset Contract and a configured bond:
     /// mocked auths, the DAO contract, a `BOND` bond (treasury =
@@ -1738,6 +1934,183 @@ mod tests {
     }
 
     #[test]
+    fn propose_rejects_deep_cycle_and_self_reference_deterministically() {
+        let (env, _token, _tc, contract_id, client, accounts) = bonded_env!();
+        let target = env.register(MockTarget, ());
+        let a = client.propose(
+            &accounts.user1,
+            &target,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        let b = client.propose(
+            &accounts.user2,
+            &target,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        let c = client.propose(
+            &accounts.user3,
+            &target,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        let d = client.propose(
+            &accounts.validator,
+            &target,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        let candidate = d + 1;
+
+        env.as_contract(&contract_id, || {
+            for (id, requires) in [
+                (a, soroban_sdk::vec![&env, b]),
+                (b, soroban_sdk::vec![&env, c]),
+                (c, soroban_sdk::vec![&env, d]),
+                (d, soroban_sdk::vec![&env, candidate]),
+            ] {
+                let mut record: Proposal = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Proposal(id))
+                    .unwrap();
+                record.requires = requires;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Proposal(id), &record);
+            }
+        });
+
+        let edge = soroban_sdk::vec![&env, a];
+        assert_eq!(
+            client
+                .try_propose(
+                    &accounts.user1,
+                    &target,
+                    &payload(&env),
+                    &DURATION,
+                    &edge,
+                    &None
+                )
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::InvalidInput
+        );
+
+        let self_reference = soroban_sdk::vec![&env, candidate];
+        assert_eq!(
+            client
+                .try_propose(
+                    &accounts.user1,
+                    &target,
+                    &payload(&env),
+                    &DURATION,
+                    &self_reference,
+                    &None
+                )
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::InvalidInput
+        );
+    }
+
+    #[test]
+    fn diamond_dependencies_execute_in_topological_order() {
+        let (env, client, accounts, a, target) = setup!();
+        let b = client.propose(
+            &accounts.user2,
+            &target,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::vec![&env, a],
+            &None,
+        );
+        let c = client.propose(
+            &accounts.user3,
+            &target,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::vec![&env, a],
+            &None,
+        );
+        let d = client.propose(
+            &accounts.validator,
+            &target,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::vec![&env, b, c],
+            &None,
+        );
+        for id in [a, b, c, d] {
+            client.vote(&id, &accounts.user2, &true);
+        }
+        env.ledger().set_timestamp(START + DURATION + 1);
+        client.execute(&d);
+        assert_eq!(
+            client.try_execute(&d).unwrap_err().unwrap(),
+            ForgeError::DeadlineReached
+        );
+        client.execute(&a);
+        client.execute(&a);
+        client.execute(&b);
+        client.execute(&b);
+        client.execute(&c);
+        client.execute(&c);
+        client.execute(&d);
+        assert_eq!(client.get_proposal(&d).state, ProposalState::Executed);
+    }
+
+    #[test]
+    fn defeated_dependency_blocks_only_its_dependents() {
+        let (env, client, accounts, dependency, target) = setup!();
+        let blocked = client.propose(
+            &accounts.user2,
+            &target,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::vec![&env, dependency],
+            &None,
+        );
+        let independent = client.propose(
+            &accounts.user3,
+            &target,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        client.vote(&dependency, &accounts.user2, &false);
+        client.vote(&blocked, &accounts.user3, &true);
+        client.vote(&independent, &accounts.user1, &true);
+        env.ledger().set_timestamp(START + DURATION + 1);
+        client.execute(&dependency);
+        client.execute(&blocked);
+        client.execute(&independent);
+        client.execute(&independent);
+        assert_eq!(
+            client.try_execute(&blocked).unwrap_err().unwrap(),
+            ForgeError::ContractInvocationFailed
+        );
+        assert_eq!(
+            client.get_proposal(&blocked).state,
+            ProposalState::Succeeded
+        );
+        assert_eq!(
+            client.get_proposal(&independent).state,
+            ProposalState::Executed
+        );
+    }
+
+    #[test]
     fn dependency_guard_orders_execution_and_keeps_failed_state_untouched() {
         let (env, client, accounts, dependency, target) = setup!();
         let requires = soroban_sdk::vec![&env, dependency];
@@ -1988,6 +2361,260 @@ mod tests {
         assert_eq!(err, ForgeError::NotFound);
     }
 
+    // -------------------------------------------------------------------
+    // Delegated-voting conservation and duplicate-vote coverage (issue #607)
+    // -------------------------------------------------------------------
+
+    /// Delegation is modeled as a token transfer before voting: when user1
+    /// transfers tokens to user2, user2's vote weight reflects the transferred
+    /// balance and user1's remaining balance still votes correctly. No voting
+    /// power is created or duplicated by the transfer.
+    #[test]
+    fn delegated_voting_power_is_counted_once() {
+        let (env, token, _tc, _contract_id, client, accounts, target_id) = fresh_bond!();
+        let stellar = StellarAssetClient::new(&env, &token);
+
+        // Give user1 extra tokens to delegate so the numbers are readable.
+        stellar.mint(&accounts.user1, &(FUNDS * 2));
+
+        let proposal_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+
+        // Delegation: user1 -> user2 via token transfer.
+        stellar.transfer(&accounts.user1, &accounts.user2, &FUNDS);
+
+        let user2_weight = stellar.balance(&accounts.user2);
+        let user1_weight = stellar.balance(&accounts.user1);
+
+        // user2 votes with the delegated power.
+        client.vote(&proposal_id, &accounts.user2, &true);
+
+        // user1 votes with the remaining balance.
+        client.vote(&proposal_id, &accounts.user1, &false);
+
+        let proposal = client.get_proposal(&proposal_id);
+
+        assert_eq!(
+            proposal.for_votes, user2_weight,
+            "for_votes must equal the delegating voter's weight"
+        );
+        assert_eq!(
+            proposal.against_votes, user1_weight,
+            "against_votes must equal the remaining voter's weight"
+        );
+        assert_eq!(
+            proposal.for_votes + proposal.against_votes,
+            user2_weight + user1_weight,
+            "tally must equal the sum of cast vote weights"
+        );
+    }
+
+    /// After a voter has already voted, further token transfers to that voter
+    /// (repeated delegation) do not let them vote again. A fresh voter who
+    /// receives tokens can still vote with that weight.
+    #[test]
+    fn repeated_delegation_does_not_duplicate_power() {
+        let (env, token, _tc, _contract_id, client, accounts, target_id) = fresh_bond!();
+        let stellar = StellarAssetClient::new(&env, &token);
+
+        let proposal_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+
+        // First delegation: user1 -> user2 (half of user1's balance).
+        stellar.transfer(&accounts.user1, &accounts.user2, &(FUNDS / 2));
+        client.vote(&proposal_id, &accounts.user2, &true);
+
+        // Repeated delegation: mint more to user1 and transfer again.
+        stellar.mint(&accounts.user1, &FUNDS);
+        stellar.transfer(&accounts.user1, &accounts.user2, &(FUNDS / 2));
+
+        let dup_err = client
+            .try_vote(&proposal_id, &accounts.user2, &true)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(dup_err, ForgeError::InvalidInput);
+
+        // A fresh voter (user3) can still vote with their own balance.
+        let user3_balance = stellar.balance(&accounts.user3);
+        client.vote(&proposal_id, &accounts.user3, &false);
+        assert_eq!(
+            stellar.balance(&accounts.user3),
+            user3_balance,
+            "voting must not spend tokens"
+        );
+    }
+
+    /// The aggregate tally must equal the sum of accepted vote records.
+    #[test]
+    fn aggregate_tally_equals_sum_of_vote_records() {
+        let (env, token, _tc, _contract_id, client, accounts, target_id) = fresh_bond!();
+        let stellar = StellarAssetClient::new(&env, &token);
+
+        // Distribute tokens unevenly across three voters.
+        stellar.mint(&accounts.user2, &FUNDS);
+        stellar.mint(&accounts.user3, &(FUNDS * 2));
+
+        let proposal_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+
+        let w1 = stellar.balance(&accounts.user1);
+        let w2 = stellar.balance(&accounts.user2);
+        let w3 = stellar.balance(&accounts.user3);
+
+        client.vote(&proposal_id, &accounts.user1, &true);
+        client.vote(&proposal_id, &accounts.user2, &true);
+        client.vote(&proposal_id, &accounts.user3, &false);
+
+        let proposal = client.get_proposal(&proposal_id);
+
+        assert_eq!(
+            proposal.for_votes,
+            w1 + w2,
+            "for_votes must equal the sum of for weights"
+        );
+        assert_eq!(
+            proposal.against_votes, w3,
+            "against_votes must equal the sum of against weights"
+        );
+        assert_eq!(
+            proposal.for_votes + proposal.against_votes,
+            w1 + w2 + w3,
+            "tally must equal the sum of all vote weights"
+        );
+    }
+
+    /// A vote cast at the deadline boundary: one ledger tick before the
+    /// deadline succeeds, exactly at the deadline is rejected with
+    /// `DeadlineReached`.
+    #[test]
+    fn vote_at_deadline_boundary() {
+        let (env, _token, _tc, _contract_id, client, accounts, target_id) = fresh_bond!();
+
+        let proposal_id = client.propose(
+            &accounts.user2,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+
+        let proposal = client.get_proposal(&proposal_id);
+        let deadline = proposal.voting_ends;
+
+        // One tick before the deadline: vote succeeds.
+        env.ledger().set_timestamp(deadline - 1);
+        client.vote(&proposal_id, &accounts.user2, &true);
+
+        // Exactly at the deadline: vote is rejected.
+        env.ledger().set_timestamp(deadline);
+        let err = client
+            .try_vote(&proposal_id, &accounts.user2, &false)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::DeadlineReached);
+    }
+
+    /// Token transfers that change a voter's balance after they have voted do
+    /// not retroactively change the already-recorded vote weight: the weight is
+    /// captured at vote time and stored in the proposal.
+    #[test]
+    fn delegation_changes_after_vote_do_not_affect_cast_vote() {
+        let (env, token, _tc, _contract_id, client, accounts, target_id) = fresh_bond!();
+        let stellar = StellarAssetClient::new(&env, &token);
+
+        let proposal_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+
+        // Delegate before voting (half of user1's balance).
+        stellar.transfer(&accounts.user1, &accounts.user2, &(FUNDS / 2));
+        let weight_before = stellar.balance(&accounts.user2);
+
+        client.vote(&proposal_id, &accounts.user2, &true);
+
+        // Reverse the delegation after the vote.
+        stellar.transfer(&accounts.user2, &accounts.user1, &(FUNDS / 2));
+        // user2 retains their original FUNDS from fresh_bond!() plus the
+        // reversal returns the delegated half, so user2 is back to their
+        // starting balance.
+        assert_eq!(
+            stellar.balance(&accounts.user2),
+            FUNDS,
+            "user2 should be back to their starting balance after reversal"
+        );
+
+        // The recorded vote weight must still reflect the weight at vote time.
+        let proposal = client.get_proposal(&proposal_id);
+        assert_eq!(
+            proposal.for_votes, weight_before,
+            "vote weight must be captured at vote time"
+        );
+
+        // user2 must not be able to vote again.
+        let err = client
+            .try_vote(&proposal_id, &accounts.user2, &false)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+    }
+
+    /// A failed vote attempt must leave the proposal's tally and state
+    /// unchanged.
+    #[test]
+    fn failed_vote_does_not_change_proposal_state() {
+        let (env, token, _tc, _contract_id, client, accounts, target_id) = fresh_bond!();
+        let stellar = StellarAssetClient::new(&env, &token);
+
+        let proposal_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+
+        // Drain user2's balance so the vote is rejected.
+        stellar.transfer(&accounts.user2, &accounts.user1, &FUNDS);
+
+        let before = client.get_proposal(&proposal_id);
+
+        let err = client
+            .try_vote(&proposal_id, &accounts.user2, &true)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+
+        let after = client.get_proposal(&proposal_id);
+        assert_eq!(after.for_votes, before.for_votes);
+        assert_eq!(after.against_votes, before.against_votes);
+        assert_eq!(after.state, before.state);
+    }
+
     #[test]
     fn execute_before_deadline_is_invalid() {
         let (_env, client, _accounts, proposal_id, _target_id) = setup!();
@@ -2068,6 +2695,219 @@ mod tests {
         let (_env, client, _accounts, _id, _target_id) = setup!();
         let err = client.try_get_proposal(&999).unwrap_err().unwrap();
         assert_eq!(err, ForgeError::NotFound);
+    }
+
+    #[test]
+    fn proposal_status_missing_is_not_found() {
+        let (_env, client, _accounts, _id, _target_id) = setup!();
+        let err = client.try_get_proposal_status(&999).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::NotFound);
+    }
+
+    #[test]
+    fn proposal_status_tracks_active_readiness() {
+        let (_env, client, accounts, proposal_id, _target_id) = setup!();
+        let status = client.get_proposal_status(&proposal_id);
+        assert_eq!(status.proposal_id, proposal_id);
+        assert_eq!(status.state, ProposalState::Active);
+        assert_eq!(status.for_votes, 0);
+        assert_eq!(status.against_votes, 0);
+        assert_eq!(status.voting_ends, START + DURATION);
+        assert!(!status.is_executable);
+        assert!(!status.is_retryable);
+
+        client.vote(&proposal_id, &accounts.user2, &true);
+        let status = client.get_proposal_status(&proposal_id);
+        assert_eq!(status.for_votes, FUNDS);
+        assert_eq!(status.against_votes, 0);
+        assert_eq!(status.voting_ends, START + DURATION);
+        assert!(!status.is_executable);
+        assert!(!status.is_retryable);
+    }
+
+    #[test]
+    fn proposal_status_marks_succeeded_executable_then_terminal() {
+        let (env, client, accounts, proposal_id, _target_id) = setup!();
+        client.vote(&proposal_id, &accounts.user2, &true);
+        env.ledger().set_timestamp(START + DURATION + 1);
+
+        client.execute(&proposal_id);
+        let status = client.get_proposal_status(&proposal_id);
+        assert_eq!(status.state, ProposalState::Succeeded);
+        assert_eq!(status.for_votes, FUNDS);
+        assert_eq!(status.voting_ends, 0);
+        assert!(status.is_executable);
+        assert!(status.is_retryable);
+
+        client.execute(&proposal_id);
+        let status = client.get_proposal_status(&proposal_id);
+        assert_eq!(status.state, ProposalState::Executed);
+        assert_eq!(status.voting_ends, 0);
+        assert!(!status.is_executable);
+        assert!(!status.is_retryable);
+    }
+
+    #[test]
+    fn proposal_status_keeps_failed_dispatch_retryable() {
+        let (env, _token, _token_client, _contract_id, client, accounts) = bonded_env!();
+        let target_id = env.register(MockTarget, ());
+        let target = MockTargetClient::new(&env, &target_id);
+        target.set_revert(&true);
+        let proposal_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        client.vote(&proposal_id, &accounts.user2, &true);
+        env.ledger().set_timestamp(START + DURATION + 1);
+        client.execute(&proposal_id);
+
+        let status = client.get_proposal_status(&proposal_id);
+        assert_eq!(status.state, ProposalState::Succeeded);
+        assert!(status.is_executable);
+        assert!(status.is_retryable);
+
+        let err = client.try_execute(&proposal_id).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::ContractInvocationFailed);
+        let status = client.get_proposal_status(&proposal_id);
+        assert_eq!(status.state, ProposalState::Succeeded);
+        assert!(status.is_executable);
+        assert!(status.is_retryable);
+
+        target.set_revert(&false);
+        client.execute(&proposal_id);
+        let status = client.get_proposal_status(&proposal_id);
+        assert_eq!(status.state, ProposalState::Executed);
+        assert!(!status.is_executable);
+        assert!(!status.is_retryable);
+    }
+
+    #[test]
+    fn proposal_status_waits_for_pending_dependency() {
+        let (env, client, accounts, parent_id, target_id) = setup!();
+        let child_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::vec![&env, parent_id],
+            &None,
+        );
+        client.vote(&child_id, &accounts.user2, &true);
+        client.vote(&parent_id, &accounts.user2, &true);
+        env.ledger().set_timestamp(START + DURATION + 1);
+        client.execute(&child_id);
+
+        let status = client.get_proposal_status(&child_id);
+        assert_eq!(status.state, ProposalState::Succeeded);
+        assert!(!status.is_executable);
+        assert!(status.is_retryable);
+
+        client.execute(&parent_id);
+        let status = client.get_proposal_status(&child_id);
+        assert!(!status.is_executable);
+        assert!(status.is_retryable);
+
+        client.execute(&parent_id);
+        let status = client.get_proposal_status(&child_id);
+        assert_eq!(status.state, ProposalState::Succeeded);
+        assert!(status.is_executable);
+        assert!(status.is_retryable);
+    }
+
+    #[test]
+    fn proposal_status_blocks_retry_when_dependency_is_defeated() {
+        let (env, client, accounts, parent_id, target_id) = setup!();
+        let child_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::vec![&env, parent_id],
+            &None,
+        );
+        client.vote(&child_id, &accounts.user2, &true);
+        client.vote(&parent_id, &accounts.user2, &false);
+        env.ledger().set_timestamp(START + DURATION + 1);
+        client.execute(&child_id);
+        client.execute(&parent_id);
+
+        let status = client.get_proposal_status(&child_id);
+        assert_eq!(status.state, ProposalState::Succeeded);
+        assert!(!status.is_executable);
+        assert!(!status.is_retryable);
+    }
+
+    #[test]
+    fn proposal_status_reports_defeated_and_cancelled_as_terminal() {
+        let (env, client, accounts, defeated_id, target_id) = setup!();
+        client.vote(&defeated_id, &accounts.user2, &false);
+        let cancelled_id = client.propose(
+            &accounts.user3,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        env.ledger().set_timestamp(START + DURATION + 1);
+        client.execute(&defeated_id);
+        client.cancel_proposal(&cancelled_id, &accounts.user3);
+
+        let status = client.get_proposal_status(&defeated_id);
+        assert_eq!(status.state, ProposalState::Defeated);
+        assert_eq!(status.for_votes, 0);
+        assert_eq!(status.against_votes, FUNDS);
+        assert_eq!(status.voting_ends, 0);
+        assert!(!status.is_executable);
+        assert!(!status.is_retryable);
+
+        let status = client.get_proposal_status(&cancelled_id);
+        assert_eq!(status.state, ProposalState::Cancelled);
+        assert_eq!(status.voting_ends, 0);
+        assert!(!status.is_executable);
+        assert!(!status.is_retryable);
+    }
+
+    #[test]
+    fn proposal_status_query_does_not_mutate_state_or_emit_events() {
+        let (env, _token, _token_client, contract_id, client, accounts, target_id) = fresh_bond!();
+        let proposal_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        client.vote(&proposal_id, &accounts.user2, &true);
+
+        let proposal_before = client.get_proposal(&proposal_id);
+        let ttl_before = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Proposal(proposal_id))
+        });
+        let events_before = env.events().all().events().len();
+        let sequence_before = env.ledger().sequence();
+
+        let _ = client.get_proposal_status(&proposal_id);
+
+        assert_eq!(client.get_proposal(&proposal_id), proposal_before);
+        assert_eq!(
+            env.as_contract(&contract_id, || {
+                env.storage()
+                    .persistent()
+                    .get_ttl(&DataKey::Proposal(proposal_id))
+            }),
+            ttl_before,
+            "status query changed TTL"
+        );
+        assert_eq!(env.events().all().events().len(), events_before);
+        assert_eq!(env.ledger().sequence(), sequence_before);
     }
 
     #[test]
@@ -2210,6 +3050,53 @@ mod tests {
         let err = client.try_execute(&proposal_id).unwrap_err().unwrap();
         assert_eq!(err, ForgeError::InvalidInput);
         assert_eq!(mock_target.count(), 1);
+    }
+
+    #[test]
+    fn execute_result_decoding_failure_preserves_proposal_bond_and_events() {
+        let (env, _token, tc, contract_id, client, accounts) = bonded_env!();
+        let target_id = env.register(MockTarget, ());
+        let target = MockTargetClient::new(&env, &target_id);
+        target.set_failure_schedule(&FailureSchedule::MalformedResult);
+        let proposal_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        client.vote(&proposal_id, &accounts.user2, &true);
+        env.ledger().set_timestamp(START + DURATION + 1);
+        client.execute(&proposal_id);
+        let bond_before = tc.balance(&contract_id);
+
+        let err = client.try_execute(&proposal_id).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::ContractInvocationFailed);
+        assert_eq!(
+            client.get_proposal(&proposal_id).state,
+            ProposalState::Succeeded
+        );
+        assert_eq!(
+            client.get_proposal(&proposal_id).bond_state,
+            BondState::Posted
+        );
+        assert_eq!(target.count(), 0);
+        assert!(target.trace().is_empty());
+        assert_eq!(tc.balance(&contract_id), bond_before);
+        assert_eq!(bond_held(&env, &contract_id), BOND);
+        assert!(dao_events(&env, &contract_id).is_empty());
+
+        target.set_failure_schedule(&FailureSchedule::None);
+        client.execute(&proposal_id);
+        assert_eq!(
+            client.get_proposal(&proposal_id).state,
+            ProposalState::Executed
+        );
+        assert_eq!(target.count(), 1);
+        assert_eq!(tc.balance(&accounts.user1), FUNDS);
+        assert_eq!(tc.balance(&contract_id), 0);
+        assert_eq!(bond_held(&env, &contract_id), 0);
     }
 
     #[test]
@@ -2598,6 +3485,197 @@ mod tests {
                 .unwrap_err()
                 .unwrap(),
             ForgeError::NotFound
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Proposal vote receipts (Issue 606)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn vote_receipt_records_yes_direction_and_recorded_weight() {
+        let (_env, client, accounts, proposal_id, _target_id) = setup!();
+        let voter = accounts.user2.clone();
+        assert_eq!(
+            client.get_vote_receipt(&proposal_id, &voter),
+            VoteReceipt {
+                has_voted: false,
+                support: None,
+                weight: 0,
+            }
+        );
+
+        client.vote(&proposal_id, &voter, &true);
+
+        assert!(client.has_voted(&proposal_id, &voter));
+        assert_eq!(
+            client.get_vote_receipt(&proposal_id, &voter),
+            VoteReceipt {
+                has_voted: true,
+                support: Some(true),
+                weight: FUNDS,
+            }
+        );
+        assert_eq!(client.get_proposal(&proposal_id).for_votes, FUNDS);
+    }
+
+    #[test]
+    fn vote_receipt_records_no_direction() {
+        let (_env, client, accounts, proposal_id, _target_id) = setup!();
+
+        client.vote(&proposal_id, &accounts.user2, &false);
+
+        assert_eq!(
+            client.get_vote_receipt(&proposal_id, &accounts.user2),
+            VoteReceipt {
+                has_voted: true,
+                support: Some(false),
+                weight: FUNDS,
+            }
+        );
+        assert_eq!(client.get_proposal(&proposal_id).against_votes, FUNDS);
+    }
+
+    #[test]
+    fn vote_receipt_returns_no_vote_result_state_for_unvoted_and_unknown_accounts() {
+        let (env, client, accounts, proposal_id, _target_id) = setup!();
+        let unknown_account = Address::generate(&env);
+
+        for voter in [&accounts.user1, &accounts.user2, &unknown_account] {
+            assert_eq!(
+                client.get_vote_receipt(&proposal_id, voter),
+                VoteReceipt {
+                    has_voted: false,
+                    support: None,
+                    weight: 0,
+                },
+                "no-vote receipt must be a result state, not an error"
+            );
+            assert!(!client.has_voted(&proposal_id, voter));
+        }
+    }
+
+    #[test]
+    fn vote_receipt_unknown_proposal_returns_not_found() {
+        let (_env, client, accounts, _proposal_id, _target_id) = setup!();
+
+        assert_eq!(
+            client
+                .try_get_vote_receipt(&999, &accounts.user2)
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::NotFound
+        );
+    }
+
+    #[test]
+    fn vote_receipt_weight_is_immutable_after_current_balance_changes() {
+        let (env, token, token_client, _contract_id, client, accounts, target_id) = fresh_bond!();
+        let proposal_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        let voter = accounts.user2.clone();
+
+        client.vote(&proposal_id, &voter, &true);
+        let recorded = client.get_vote_receipt(&proposal_id, &voter);
+        assert_eq!(recorded.weight, FUNDS);
+
+        // Increase the voter's *current* balance. The receipt and the tally
+        // must keep the weight that was recorded at vote time.
+        StellarAssetClient::new(&env, &token).mint(&voter, &5_000);
+        assert_eq!(token_client.balance(&voter), FUNDS + 5_000);
+
+        assert_eq!(client.get_vote_receipt(&proposal_id, &voter), recorded);
+        assert_eq!(client.get_proposal(&proposal_id).for_votes, FUNDS);
+    }
+
+    #[test]
+    fn vote_receipts_are_independent_per_account_and_direction() {
+        let (env, token, token_client, _contract_id, client, accounts, target_id) = fresh_bond!();
+        StellarAssetClient::new(&env, &token).mint(&accounts.user2, &500);
+        let proposal_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+
+        client.vote(&proposal_id, &accounts.user2, &true);
+        client.vote(&proposal_id, &accounts.user3, &false);
+
+        assert_eq!(
+            client.get_vote_receipt(&proposal_id, &accounts.user2),
+            VoteReceipt {
+                has_voted: true,
+                support: Some(true),
+                weight: token_client.balance(&accounts.user2),
+            }
+        );
+        assert_eq!(
+            client.get_vote_receipt(&proposal_id, &accounts.user3),
+            VoteReceipt {
+                has_voted: true,
+                support: Some(false),
+                weight: token_client.balance(&accounts.user3),
+            }
+        );
+        assert_eq!(
+            client.get_vote_receipt(&proposal_id, &accounts.validator),
+            VoteReceipt {
+                has_voted: false,
+                support: None,
+                weight: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn vote_receipt_query_does_not_mutate_proposal_vote_or_ttl_storage() {
+        let (env, _token, _token_client, contract_id, client, accounts, target_id) = fresh_bond!();
+        let proposal_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        client.vote(&proposal_id, &accounts.user2, &true);
+
+        let proposal_before = client.get_proposal(&proposal_id);
+        let receipt_before = client.get_vote_receipt(&proposal_id, &accounts.user2);
+        let voted_before = client.has_voted(&proposal_id, &accounts.user2);
+        let count_before = client.get_proposal_count();
+        let sequence_before = env.ledger().sequence();
+        let events_before = env.events().all().events().len();
+        let ttl_before = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+
+        let receipt_after = client.get_vote_receipt(&proposal_id, &accounts.user2);
+
+        assert_eq!(receipt_after, receipt_before);
+        assert_eq!(client.get_proposal(&proposal_id), proposal_before);
+        assert_eq!(
+            client.has_voted(&proposal_id, &accounts.user2),
+            voted_before
+        );
+        assert_eq!(client.get_proposal_count(), count_before);
+        assert_eq!(env.ledger().sequence(), sequence_before);
+        assert_eq!(
+            env.events().all().events().len(),
+            events_before,
+            "vote receipt query emitted an event"
+        );
+        assert_eq!(
+            env.as_contract(&contract_id, || env.storage().instance().get_ttl()),
+            ttl_before,
+            "vote receipt query changed TTL"
         );
     }
 
@@ -3247,41 +4325,76 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
-    // Quorum configuration and validation tests (Issue #632)
-    // -------------------------------------------------------------------
-    #[test]
-    fn set_quorum_validates_boundary() {
-        let (_env, client, _accounts, _target_id) = unbonded!();
-        // Valid bounds: 0 to 10000
-        client.set_quorum(&0);
-        client.set_quorum(&10000);
+    // ------------------------------------------------------------------
+    // Quorum, voting-window, and terminal-state boundaries
+    //
+    // Each test isolates one lifecycle rule and asserts both the resulting
+    // proposal record and any external side effects (target dispatch), so a
+    // regression names the boundary it broke.
+    // ------------------------------------------------------------------
 
-        // Invalid bound: > 10000
-        let err = client.try_set_quorum(&10001).unwrap_err().unwrap();
-        assert_eq!(err, ForgeError::InvalidInput);
+    /// Below the required strict majority: the proposal is defeated, no
+    /// dispatch happens, and the tally is preserved.
+    #[test]
+    fn quorum_below_majority_is_defeated_without_dispatch() {
+        let (env, client, accounts, proposal_id, target_id) = setup!();
+        let target = MockTargetClient::new(&env, &target_id);
+
+        client.vote(&proposal_id, &accounts.user2, &false);
+        client.vote(&proposal_id, &accounts.user3, &true);
+        client.vote(&proposal_id, &accounts.validator, &false);
+        let before = client.get_proposal(&proposal_id);
+        assert!(before.for_votes < before.against_votes);
+
+        env.ledger().set_timestamp(START + DURATION + 1);
+        client.execute(&proposal_id);
+
+        let after = client.get_proposal(&proposal_id);
+        assert_eq!(after.state, ProposalState::Defeated);
+        assert_eq!(after.for_votes, before.for_votes);
+        assert_eq!(after.against_votes, before.against_votes);
+        assert_eq!(target.count(), 0, "defeated proposal must not dispatch");
     }
 
+    /// Exactly at the threshold: a tie does not meet the strict majority,
+    /// so the proposal is defeated and stays non-executable.
     #[test]
-    fn execute_respects_quorum_satisfaction_and_shortfall() {
-        let (env, _token, _tc, _contract_id, client, accounts, target_id) = fresh_bond!();
+    fn quorum_exactly_at_tie_is_defeated_and_never_executes() {
+        let (env, client, accounts, proposal_id, target_id) = setup!();
+        let target = MockTargetClient::new(&env, &target_id);
 
-        // Set quorum to 50% (5000 basis points)
-        client.set_quorum(&5000);
-
-        // Create proposal
-        let proposal_id = client.propose(
-            &accounts.user1,
-            &target_id,
-            &payload(&env),
-            &DURATION,
-            &soroban_sdk::Vec::new(&env),
-            &None,
-        );
-
-        // Total supply is FUNDS (10_000). 50% quorum = 5_000 required votes.
-        // User2 votes with FUNDS (10_000), satisfying quorum and majority.
         client.vote(&proposal_id, &accounts.user2, &true);
+        client.vote(&proposal_id, &accounts.user3, &false);
+        let before = client.get_proposal(&proposal_id);
+        assert_eq!(before.for_votes, before.against_votes);
+
+        env.ledger().set_timestamp(START + DURATION);
+        client.execute(&proposal_id);
+        assert_eq!(
+            client.get_proposal(&proposal_id).state,
+            ProposalState::Defeated
+        );
+        assert_eq!(target.count(), 0);
+
+        assert_eq!(
+            client.try_execute(&proposal_id).unwrap_err().unwrap(),
+            ForgeError::InvalidInput
+        );
+        assert_eq!(target.count(), 0);
+    }
+
+    /// Above the threshold: finalisation succeeds and dispatch happens
+    /// exactly once, after which the proposal is terminal.
+    #[test]
+    fn quorum_above_majority_finalises_and_dispatches_once() {
+        let (env, client, accounts, proposal_id, target_id) = setup!();
+        let target = MockTargetClient::new(&env, &target_id);
+
+        client.vote(&proposal_id, &accounts.user2, &true);
+        client.vote(&proposal_id, &accounts.user3, &true);
+        client.vote(&proposal_id, &accounts.validator, &false);
+        let before = client.get_proposal(&proposal_id);
+        assert!(before.for_votes > before.against_votes);
 
         env.ledger().set_timestamp(START + DURATION + 1);
         client.execute(&proposal_id);
@@ -3289,26 +4402,192 @@ mod tests {
             client.get_proposal(&proposal_id).state,
             ProposalState::Succeeded
         );
+        assert_eq!(target.count(), 0, "finalisation alone must not dispatch");
+
+        client.execute(&proposal_id);
+        assert_eq!(
+            client.get_proposal(&proposal_id).state,
+            ProposalState::Executed
+        );
+        assert_eq!(target.count(), 1);
+    }
+
+    /// Voting is open until the deadline: the last ledger before
+    /// `voting_ends` is accepted, while the deadline ledger and any later
+    /// ledger are rejected with the tally untouched.
+    #[test]
+    fn voting_window_accepts_last_ledger_before_deadline_only() {
+        let (env, client, accounts, proposal_id, _target_id) = setup!();
+
+        env.ledger().set_timestamp(START + DURATION - 1);
+        client.vote(&proposal_id, &accounts.user2, &true);
+        let after_last = client.get_proposal(&proposal_id);
+        assert_eq!(after_last.for_votes, FUNDS);
+
+        for timestamp in [START + DURATION, START + DURATION + 1] {
+            env.ledger().set_timestamp(timestamp);
+            assert_eq!(
+                client
+                    .try_vote(&proposal_id, &accounts.user3, &false)
+                    .unwrap_err()
+                    .unwrap(),
+                ForgeError::DeadlineReached
+            );
+            let unchanged = client.get_proposal(&proposal_id);
+            assert_eq!(unchanged.for_votes, after_last.for_votes);
+            assert_eq!(unchanged.against_votes, after_last.against_votes);
+            assert!(!client.has_voted(&proposal_id, &accounts.user3));
+        }
+    }
+
+    /// Terminal lifecycle states reject execution, voting, and cancellation
+    /// without mutating the stored proposal.
+    #[test]
+    fn terminal_states_reject_mutation_and_reexecution() {
+        let (env, client, accounts, proposal_id, target_id) = setup!();
+        let target = MockTargetClient::new(&env, &target_id);
+
+        // Executed.
+        client.vote(&proposal_id, &accounts.user2, &true);
+        env.ledger().set_timestamp(START + DURATION + 1);
+        client.execute(&proposal_id);
+        client.execute(&proposal_id);
+        let executed = client.get_proposal(&proposal_id);
+        assert_eq!(executed.state, ProposalState::Executed);
+        assert_rejections_leave_proposal_untouched(&client, &accounts, &executed);
+        assert_eq!(target.count(), 1);
+
+        // Defeated.
+        let defeated_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        client.vote(&defeated_id, &accounts.user2, &false);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + DURATION + 1);
+        client.execute(&defeated_id);
+        let defeated = client.get_proposal(&defeated_id);
+        assert_eq!(defeated.state, ProposalState::Defeated);
+        assert_rejections_leave_proposal_untouched(&client, &accounts, &defeated);
+        assert_eq!(target.count(), 1);
+
+        // Cancelled.
+        let cancelled_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        client.cancel_proposal(&cancelled_id, &accounts.user1);
+        let cancelled = client.get_proposal(&cancelled_id);
+        assert_eq!(cancelled.state, ProposalState::Cancelled);
+        assert_rejections_leave_proposal_untouched(&client, &accounts, &cancelled);
+        assert_eq!(target.count(), 1);
+    }
+
+    /// Shared assertion: every state-changing entrypoint rejects a terminal
+    /// proposal, and the stored record is byte-for-byte unchanged.
+    fn assert_rejections_leave_proposal_untouched(
+        client: &SorobanForgeDaoGovernanceClient<'_>,
+        accounts: &TestAccounts,
+        before: &Proposal,
+    ) {
+        assert_eq!(
+            client
+                .try_execute(&before.proposal_id)
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::InvalidInput
+        );
+        assert_eq!(
+            client
+                .try_vote(&before.proposal_id, &accounts.user2, &true)
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::InvalidInput
+        );
+        assert_eq!(
+            client
+                .try_cancel_proposal(&before.proposal_id, &before.proposer)
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::InvalidInput
+        );
+        assert_eq!(&client.get_proposal(&before.proposal_id), before);
+    }
+
+    /// A reverted dispatch is retryable: the proposal stays `Succeeded` and
+    /// the same proposal can complete once the target stops reverting.
+    #[test]
+    fn retryable_dispatch_failure_keeps_proposal_succeeded_until_success() {
+        let (env, _token, _tc, _contract_id, client, accounts) = bonded_env!();
+        let target_id = env.register(MockTarget, ());
+        let target = MockTargetClient::new(&env, &target_id);
+        target.set_revert(&true);
+
+        let proposal_id = client.propose(
+            &accounts.user1,
+            &target_id,
+            &payload(&env),
+            &DURATION,
+            &soroban_sdk::Vec::new(&env),
+            &None,
+        );
+        client.vote(&proposal_id, &accounts.user2, &true);
+        env.ledger().set_timestamp(START + DURATION + 1);
+        client.execute(&proposal_id);
+
+        let before_failure = client.get_proposal(&proposal_id);
+        assert_eq!(before_failure.state, ProposalState::Succeeded);
+
+        assert_eq!(
+            client.try_execute(&proposal_id).unwrap_err().unwrap(),
+            ForgeError::ContractInvocationFailed
+        );
+        assert_eq!(&client.get_proposal(&proposal_id), &before_failure);
+        assert_eq!(target.count(), 0);
+
+        target.set_revert(&false);
+        client.execute(&proposal_id);
+        assert_eq!(
+            client.get_proposal(&proposal_id).state,
+            ProposalState::Executed
+        );
+        assert_eq!(target.count(), 1);
     }
 
     #[test]
-    fn execute_defeats_proposal_on_quorum_shortfall() {
-        let env = Env::default();
-        env.mock_all_auths();
+    fn vote_power_snapshot_queries_cover_before_after_and_finalized_proposals() {
+        let (env, _token, tc, _contract_id, client, accounts, target_id) = fresh_bond!();
+        env.ledger().set_sequence_number(42);
         env.ledger().set_timestamp(START);
 
-        let token_address = env.register(QuorumMockToken, ());
-        let contract_id = env.register(DaoGovernance, ());
-        let client = SorobanForgeDaoGovernanceClient::new(&env, &contract_id);
-        let accounts = TestAccounts::generate(&env);
+        // Unknown proposal returns NotFound across all snapshot queries.
+        assert_eq!(
+            client.try_get_proposal_snapshot(&999).unwrap_err().unwrap(),
+            ForgeError::NotFound
+        );
+        assert_eq!(
+            client
+                .try_get_vote_snapshot(&999, &accounts.user2)
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::NotFound
+        );
+        assert_eq!(
+            client
+                .try_get_voter_weight(&999, &accounts.user2)
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::NotFound
+        );
 
-        client.initialize(&token_address);
-        client.configure_bond(&token_address, &BOND, &accounts.deployer);
-
-        // Set quorum to 90% (9000 basis points). Total supply is 100,000 -> required votes = 90,000.
-        client.set_quorum(&9000);
-
-        let target_id = env.register(MockTarget, ());
         let proposal_id = client.propose(
             &accounts.user1,
             &target_id,
@@ -3318,16 +4597,102 @@ mod tests {
             &None,
         );
 
-        // User2 votes for, but weight is 10,000 (total votes = 10,000 < 90,000 required).
+        // Proposal snapshot captures creation ledger sequence and timestamp.
+        let prop_snap = client.get_proposal_snapshot(&proposal_id);
+        assert_eq!(
+            prop_snap,
+            ProposalSnapshot {
+                proposal_id,
+                snapshot_ledger: 42,
+                snapshot_timestamp: START,
+            }
+        );
+
+        // Before vote: voter and non-voter queries return weight 0 and proposal snapshot ledger/time.
+        assert_eq!(client.get_voter_weight(&proposal_id, &accounts.user2), 0);
+        assert_eq!(
+            client.get_vote_snapshot(&proposal_id, &accounts.user2),
+            VoteSnapshot {
+                proposal_id,
+                has_voted: false,
+                support: None,
+                weight: 0,
+                snapshot_ledger: 42,
+                snapshot_timestamp: START,
+            }
+        );
+
+        // Advance ledger and cast votes.
+        env.ledger().set_sequence_number(55);
+        env.ledger().set_timestamp(START + 100);
         client.vote(&proposal_id, &accounts.user2, &true);
 
+        env.ledger().set_sequence_number(60);
+        env.ledger().set_timestamp(START + 250);
+        client.vote(&proposal_id, &accounts.user3, &false);
+
+        // After vote: recorded weight and vote ledger/time are exposed.
+        assert_eq!(
+            client.get_voter_weight(&proposal_id, &accounts.user2),
+            FUNDS
+        );
+        assert_eq!(
+            client.get_vote_snapshot(&proposal_id, &accounts.user2),
+            VoteSnapshot {
+                proposal_id,
+                has_voted: true,
+                support: Some(true),
+                weight: FUNDS,
+                snapshot_ledger: 55,
+                snapshot_timestamp: START + 100,
+            }
+        );
+
+        // Later token movement does not alter recorded weight or non-voter weight.
+        tc.transfer(&accounts.user2, &accounts.validator, &(FUNDS / 2));
+        tc.transfer(&accounts.user3, &accounts.validator, &FUNDS);
+        assert_eq!(
+            client.get_voter_weight(&proposal_id, &accounts.user2),
+            FUNDS
+        );
+        assert_eq!(
+            client.get_voter_weight(&proposal_id, &accounts.user3),
+            FUNDS
+        );
+        assert_eq!(
+            client.get_voter_weight(&proposal_id, &accounts.validator),
+            0
+        );
+
+        // Finalize (Defeated on tie) and verify snapshots remain immutable.
+        env.ledger().set_sequence_number(100);
         env.ledger().set_timestamp(START + DURATION + 1);
         client.execute(&proposal_id);
-
-        // Should transition to Defeated due to quorum shortfall despite having a majority
         assert_eq!(
             client.get_proposal(&proposal_id).state,
             ProposalState::Defeated
+        );
+        assert_eq!(
+            client.get_vote_snapshot(&proposal_id, &accounts.user2),
+            VoteSnapshot {
+                proposal_id,
+                has_voted: true,
+                support: Some(true),
+                weight: FUNDS,
+                snapshot_ledger: 55,
+                snapshot_timestamp: START + 100,
+            }
+        );
+        assert_eq!(
+            client.get_vote_snapshot(&proposal_id, &accounts.validator),
+            VoteSnapshot {
+                proposal_id,
+                has_voted: false,
+                support: None,
+                weight: 0,
+                snapshot_ledger: 42,
+                snapshot_timestamp: START,
+            }
         );
     }
 }
@@ -3345,3 +4710,9 @@ mod props;
 
 #[cfg(test)]
 mod indexer_fixtures;
+
+#[cfg(test)]
+mod model_check;
+
+#[cfg(test)]
+mod vote_transfer_props;

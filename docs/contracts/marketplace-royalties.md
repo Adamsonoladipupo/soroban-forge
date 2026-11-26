@@ -9,13 +9,22 @@ and settled atomically in real SEP-41 tokens by `settle_sale` (one sale) or
 
 ```rust
 fn set_royalty(collection, recipient, bps) -> Result<(), ForgeError>
-fn set_royalty_splits(collection, splits: Vec<RoyaltyShare>) -> Result<(), ForgeError>
+fn set_royalty_splits(collection, recipients: Vec<RoyaltyShare>) -> Result<(), ForgeError>
+fn set_max_royalty_cap(collection, max_bps) -> Result<(), ForgeError>
+fn get_max_royalty_cap(collection) -> u32
+fn set_royalty_tiers(collection, tiers: Vec<(i128, u32)>) -> Result<(), ForgeError>
+fn clear_royalty_tiers(collection) -> Result<(), ForgeError>
+fn get_royalty_tiers(collection) -> Vec<(i128, u32)>
+fn disable_royalty(collection) -> Result<(), ForgeError>
+fn enable_royalty(collection) -> Result<(), ForgeError>
 fn distribute(collection, token, payer, seller, amount) -> Result<i128, ForgeError>
 fn settle_sale(collection, token, payer, seller, amount) -> Result<Settlement, ForgeError>
 fn settle_sales(collection, token, payer, sales: Vec<(seller, amount)>) -> Result<Vec<Settlement>, ForgeError>
 fn get_royalty(collection) -> Result<Royalty, ForgeError>
+fn get_royalty_splits(collection) -> Result<Vec<RoyaltyShare>, ForgeError>
 fn get_settlement_summary(collection) -> Result<SettlementSummary, ForgeError>
 fn quote_sale(collection, amount) -> Result<SaleQuote, ForgeError>
+fn preview_settlement(collection, amount) -> Result<SettlementPreview, ForgeError>
 fn touch_ttl(collection) -> Result<(), ForgeError>
 
 // Recipient rotation
@@ -67,6 +76,17 @@ and only need the royalty leg settled; a `Disabled` or zero-bps
 configuration transfers nothing and returns the full `amount`. It requires
 the collection's and the payer's authorization, and emits the same
 `SaleSettled` event as the settlement entrypoints.
+
+### Price-bracket royalty tiers
+
+Collections can configure sale-size brackets via `set_royalty_tiers(collection, tiers)` where each entry is `(min_amount, bps)`:
+
+- **Authorization**: requires `collection.require_auth()`.
+- **Validation**: non-empty tier tables must start at `min_amount == 1`, be strictly increasing in `min_amount` (unsorted or duplicate minimums return `ForgeError::InvalidInput`), keep every `bps <= 10_000` and within the collection's configured `max_royalty_cap`, and contain at most `MAX_ROYALTY_TIERS` (`16`) entries. The 16-tier cap bounds persistent storage size and per-sale scan cost across `MAX_SETTLE_SALES` (20-sale) batches while covering typical multi-bracket schedules.
+- **Bracket resolution**: `settle_sale`, `settle_sales`, `distribute`, `quote_sale`, and `preview_settlement` select the `bps` of the highest tier whose `min_amount <= amount` (so each sale in a `settle_sales` batch resolves its own bracket independently).
+- **Multi-recipient split application**: once the active tier rate `tier_bps` is selected, each registered recipient receives `floor(amount * tier_bps * recipient_bps / (10_000 * total_configured_bps))` using overflow-safe quotient/remainder arithmetic (or equal shares across configured recipients if all configured weights are zero). Each share is floored independently and any rounding dust stays with the seller, preserving `sum(recipient_shares) + seller_net == amount` exactly at every bracket edge (`min - 1`, `min`, `min + 1`) and up to `i128::MAX`. `Disabled` collections continue settling in full to the seller at 0 bps.
+- **Unchanged default**: collections without tiers behave identically to flat-rate settlement.
+- **Query and clearing**: `get_royalty_tiers(collection)` is a pure read-only view returning the stored `Vec<(i128, u32)>` (or an empty vector when unset) with no authorization, events, storage writes, or TTL bumps. Clearing tiers is supported via either `set_royalty_tiers(collection, vec![])` or `clear_royalty_tiers(collection)` (both require `collection` authorization) and immediately restores flat-rate behavior.
 
 ### Sale quotes
 
@@ -273,6 +293,25 @@ marketplace UI can display "you will pay X, royalty is Y, seller receives
 Z" from the contract's own math instead of a parallel off-chain
 implementation.
 
+### Settlement preview
+
+`preview_settlement(collection, amount)` returns `gross`, `recipients`
+(ordered address/amount pairs, including zero payments), `royalty_amount`,
+`seller_net`, and `rounding_residue`. The recipient amounts sum to
+`royalty_amount`, and that total plus `seller_net` equals `gross`.
+
+The residue is the royalty floored once at the effective aggregate rate
+minus the sum of the independently floored recipient amounts. It is already
+included in seller proceeds. For example, two 3,333 bps entries on a sale of
+101 each receive 33. The seller receives 35, including 1 unit of split
+rounding residue. Disabled and zero-rate configurations pay no royalties.
+Legacy single-recipient configurations return one entry.
+
+This query reads the registered recipient list, which is validated when set.
+It requires no authorization and does not change balances, events, storage,
+or TTL. An unregistered collection returns `NotFound` and a non-positive
+amount returns `InvalidInput`.
+
 ### Batch settlement
 
 `settle_sales` settles a batch of sales of one collection in one invocation
@@ -283,10 +322,8 @@ against one payer authorization, with per-sale semantics identical to
    whole batch before any token moves: `sales` must be non-empty and at
    most `MAX_SETTLE_SALES` (20) long, and every `amount` must be positive
    (`InvalidInput` for either). The cap bounds one transaction's worst case
-   to at most `2 * MAX_SETTLE_SALES` nested token transfers, keeping a
-   batched settlement inside Soroban's per-transaction instruction budget
-   and ledger bandwidth; larger sets issue several calls, each still
-   atomic.
+   to at most `(1 + MAX_ROYALTY_RECIPIENTS) * MAX_SETTLE_SALES` nested
+   token transfers. Larger sets use several calls, each atomic.
 2. Require the collection's and the payer's authorization once — the
    payer's single `require_auth` covers every nested token transfer in the
    batch.
@@ -294,9 +331,11 @@ against one payer authorization, with per-sale semantics identical to
    arithmetic, then stage the updated settlement totals by adding the
    aggregate to the stored summary (`ArithmeticOverflow` — checked against
    the existing totals, still before any transfer).
-4. Transfer each sale in order, seller first and royalty recipient last,
-   skipping the recipient transfer when the share floors to zero — exactly
-   the `settle_sale` order, sale after sale.
+4. Transfer each sale in order, seller first and then each royalty entry in
+   registration order. Duplicate addresses are accepted and receive the sum
+   of their independently floored payments. A zero-rate entry or a payment
+   that floors to zero produces no transfer. The sum paid to all recipients
+   equals the batch's `royalties_paid` delta.
 5. Only after every transfer succeeds, commit the summary once with the
    batch's aggregate deltas (`sales`, `gross_volume`, `royalties_paid`) and
    return the per-sale `Settlement`s in sale order.
@@ -319,13 +358,13 @@ entrypoints.
 
 ## Storage & TTL Maintenance
 
-Persistent storage: `Royalty` configuration records (`DataKey::Royalty(Address)`) and `SettlementSummary` records (`DataKey::Summary(Address)`).
+Persistent storage: `Royalty` configuration records (`DataKey::Royalty(Address)`), multi-recipient splits (`DataKey::Splits(Address)`), collection max-rate caps (`DataKey::MaxCap(Address)`), price-bracket royalty tiers (`DataKey::Tiers(Address)`), and `SettlementSummary` records (`DataKey::Summary(Address)`).
 
-`set_royalty`, `distribute`, `settle_sale`, and `settle_sales` extend
+`set_royalty`, `set_royalty_splits`, `set_max_royalty_cap`, `set_royalty_tiers`, `distribute`, `settle_sale`, and `settle_sales` extend
 persistent storage TTL on every write to a 30-day horizon
 (`30 * DAY_IN_LEDGERS = 518,400` ledgers).
 
-A permissionless public keeper entrypoint `touch_ttl(collection)` allows anyone to bump persistent storage TTL for a collection's `Royalty` and `Summary` records. If no royalty configuration exists for `collection`, `touch_ttl` returns `ForgeError::NotFound`.
+A permissionless public keeper entrypoint `touch_ttl(collection)` allows anyone to bump persistent storage TTL for a collection's `Royalty`, `Splits`, `MaxCap`, `Tiers`, and `Summary` records. If no royalty configuration exists for `collection`, `touch_ttl` returns `ForgeError::NotFound`.
 
 ## Events
 
