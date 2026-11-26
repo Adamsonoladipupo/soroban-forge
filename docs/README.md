@@ -7,6 +7,8 @@ Soroban smart contracts and developer tooling for the Stellar ecosystem.
 
 - [ForgeBot](FORGEBOT.md) — pull-request automation: CI status reporting and
   contributor feedback (not an official Drips or Stellar bot)
+- [Focused Crate CI Validation](FOCUSED-CI.md) — changed-crate path-matrix
+  resolution, workflow linting, and local regression tests
 - [Architecture](architecture/architecture.md)
 - [Best Practices](best-practices/index.md)
 - [Contracts](contracts/index.md)
@@ -25,6 +27,7 @@ Read these before relying on or contributing to the contracts:
   second rejection
 - [Resubmission Plan](RESUBMISSION.md) — the phased plan for the
   flagship escrow port (SDK 27, SEP-41 settlement, disputes, events)
+- [Soroban Forge and OpenZeppelin](OPENZEPPELIN.md) — what each library covers, how to use them together, and the testnet proof with an OpenZeppelin token.
 - [Reviewer Walkthrough](WALKTHROUGH.md) — verify the repo end-to-end in
   ~5 minutes: tests, live testnet demo with expected output, on-chain checks
 

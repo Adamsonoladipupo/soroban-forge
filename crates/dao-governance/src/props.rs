@@ -559,18 +559,29 @@ impl RefModel {
 
     fn revise(&mut self, idx: usize, support: bool) -> bool {
         match self.receipts.get_mut(&idx) {
-            None => false,            // not a voter
+            None => false,                          // not a voter
             Some((_, s)) if *s == support => false, // same direction
-            Some((_, s)) => { *s = support; true }
+            Some((_, s)) => {
+                *s = support;
+                true
+            }
         }
     }
 
     fn for_votes(&self) -> i128 {
-        self.receipts.values().filter(|(_, s)| *s).map(|(w, _)| w).sum()
+        self.receipts
+            .values()
+            .filter(|(_, s)| *s)
+            .map(|(w, _)| w)
+            .sum()
     }
 
     fn against_votes(&self) -> i128 {
-        self.receipts.values().filter(|(_, s)| !s).map(|(w, _)| w).sum()
+        self.receipts
+            .values()
+            .filter(|(_, s)| !s)
+            .map(|(w, _)| w)
+            .sum()
     }
 }
 

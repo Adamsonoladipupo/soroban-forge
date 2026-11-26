@@ -13,11 +13,9 @@
 //! - Tally conservation: for_votes + against_votes is unchanged by any revision.
 //! - VoteRevised event emitted with correct fields.
 //! - revision_count increments on every successful revision.
-//! - Initial VoteReceipt has zero revision_count.
+//! - A fresh vote has a zero revision count.
 
-use crate::{
-    DaoGovernance, DataKey, ProposalState, SorobanForgeDaoGovernanceClient, VoteReceipt,
-};
+use crate::{DaoGovernance, DataKey, ProposalState, SorobanForgeDaoGovernanceClient, VoteReceipt};
 use soroban_forge_shared_utils::ForgeError;
 use soroban_forge_test_utils::{MockTarget, TestAccounts};
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
@@ -37,13 +35,32 @@ fn payload(env: &Env) -> Bytes {
     Bytes::from_array(env, &[0xC0, 0xDE, 0x00, 0xFF])
 }
 
-/// Read the VoteReceipt for a voter directly from contract storage.
-fn get_receipt(env: &Env, contract_id: &Address, proposal_id: u64, voter: &Address) -> VoteReceipt {
+/// A voter's recorded vote plus how many times it was revised.
+struct VoteView {
+    weight: i128,
+    support: bool,
+    revision_count: u32,
+}
+
+/// Read a voter's vote receipt and revision count directly from contract storage.
+fn get_receipt(env: &Env, contract_id: &Address, proposal_id: u64, voter: &Address) -> VoteView {
     env.as_contract(contract_id, || {
-        env.storage()
+        let receipt = env
+            .storage()
             .instance()
-            .get::<DataKey, VoteReceipt>(&DataKey::Vote(proposal_id, voter.clone()))
-            .expect("VoteReceipt must exist")
+            .get::<DataKey, VoteReceipt>(&DataKey::VoteReceipt(proposal_id, voter.clone()))
+            .expect("VoteReceipt must exist");
+        assert!(receipt.has_voted);
+        let revision_count = env
+            .storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::VoteRevisions(proposal_id, voter.clone()))
+            .unwrap_or(0);
+        VoteView {
+            weight: receipt.weight,
+            support: receipt.support.expect("a cast vote records its direction"),
+            revision_count,
+        }
     })
 }
 

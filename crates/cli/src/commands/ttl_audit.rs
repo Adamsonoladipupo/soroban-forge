@@ -20,7 +20,6 @@ use stellar_xdr::curr::{
 };
 
 use crate::cli::TtlAuditArgs;
-use crate::commands::plan::Plan;
 
 // ── Network profiles ─────────────────────────────────────────────────────────
 
@@ -411,11 +410,29 @@ pub const DEFAULT_THRESHOLD: u32 = 120_960;
 
 // ── Plan generation ───────────────────────────────────────────────────────────
 
+/// Version-1 transaction plan written by `--plan`: one `extend_ttl` invoke per
+/// entry below the threshold.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Plan {
+    pub version: String,
+    pub network: String,
+    pub source: String,
+    pub calls: Vec<Call>,
+}
+
+/// One contract call in a [`Plan`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Call {
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub contract: String,
+    pub function: String,
+    pub args: Vec<String>,
+}
+
 /// Build an extend-TTL plan for all entries that are below the threshold.
 /// The plan uses the existing `plan` command format (version 1).
 pub fn build_extend_plan(report: &AuditReport, source: &str, extend_to: u32) -> Plan {
-    use crate::commands::plan::Call;
-
     let calls = report
         .entries
         .iter()
@@ -425,7 +442,6 @@ pub fn build_extend_plan(report: &AuditReport, source: &str, extend_to: u32) -> 
             contract: report.contract.clone(),
             function: "extend_ttl".to_owned(),
             args: vec![format!("key={}", e.key), format!("extend_to={extend_to}")],
-            assertion: None,
         })
         .collect();
 
@@ -854,7 +870,7 @@ mod tests {
 
         assert!(plan_path.exists(), "plan file should be written");
         let raw = fs::read_to_string(&plan_path).unwrap();
-        let plan: crate::commands::plan::Plan = serde_json::from_str(&raw).unwrap();
+        let plan: Plan = serde_json::from_str(&raw).unwrap();
         assert_eq!(plan.version, "1");
         assert_eq!(plan.network, "testnet");
         assert_eq!(plan.source, "alice");
@@ -881,7 +897,7 @@ mod tests {
 
         // Plan is still written but with zero calls.
         let raw = fs::read_to_string(&plan_path).unwrap();
-        let plan: crate::commands::plan::Plan = serde_json::from_str(&raw).unwrap();
+        let plan: Plan = serde_json::from_str(&raw).unwrap();
         assert!(plan.calls.is_empty());
     }
 

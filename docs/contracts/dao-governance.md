@@ -25,6 +25,8 @@ fn get_proposal(proposal_id) -> Result<Proposal, ForgeError>
 fn get_proposal_count() -> u64
 fn get_proposals(offset, limit) -> Result<Vec<Proposal>, ForgeError>
 fn has_voted(proposal_id, voter) -> Result<bool, ForgeError>
+fn get_vote_receipt(proposal_id, voter) -> Result<VoteReceipt, ForgeError>
+fn get_vote_revision_count(proposal_id, voter) -> Result<u32, ForgeError>
 fn get_active_proposal_count(proposer) -> u32
 fn touch_ttl(proposal_id) -> Result<(), ForgeError>
 ```
@@ -120,8 +122,8 @@ Transition rules enforced by the contract:
   (expired, cancelled, executed, or defeated), `ForgeError::DeadlineReached`
   once the deadline passes, and `ForgeError::InvalidInput` if the voter has
   not cast a vote yet or if the requested direction matches the existing one.
-  Each successful revision increments a `revision_count` on the stored
-  `VoteReceipt` and emits a `VoteRevised` event. Failed revisions leave all
+  Each successful revision increments the voter's revision count (readable
+  via `get_vote_revision_count`) and emits a `VoteRevised` event. Failed revisions leave all
   state unchanged.
 - `execute` before the deadline is `ForgeError::InvalidInput`.
 - On `Active` past deadline, `execute` finalises: quorum and the category's
@@ -136,6 +138,46 @@ Transition rules enforced by the contract:
   (`ForgeError::Unauthorized` otherwise) and an `Active` proposal; it works
   even after the deadline and after quorum is met, as long as the proposal
   has not been executed or cancelled.
+
+## Vote receipts
+
+`get_vote_receipt(proposal_id, voter)` is a read-only view for UIs and audit
+trails. It returns the `VoteReceipt` recorded when the vote was cast:
+
+```rust
+struct VoteReceipt {
+    has_voted: bool,
+    support: Option<bool>, // Some(true) = for, Some(false) = against
+    weight: i128,          // governance-token balance at vote time
+}
+```
+
+- A voter with no vote gets `has_voted: false`, `support: None`, `weight: 0`.
+- An unknown proposal id returns `ForgeError::NotFound`; a well-formed address
+  that has never voted is simply a no-vote receipt. Malformed addresses are
+  rejected by the host before the query runs (bad addresses map to
+  `ForgeError::InvalidInput` in the shared error registry).
+- `Abstain` does not exist in this contract; `vote` accepts only `support: bool`.
+- The receipt is immutable: later balance changes or delegation changes never
+  alter `weight`. The query performs no writes and does not extend TTLs.
+
+Generated TypeScript client usage:
+
+```ts
+import { Client } from "@soroban-forge/dao-governance-client";
+
+const client = new Client({
+  rpcUrl,
+  networkPassphrase,
+  contractId,
+});
+
+const receipt = await client.get_vote_receipt({
+  proposal_id: 42n,
+  voter: "G…",
+});
+console.log(receipt.result?.has_voted, receipt.result?.support, receipt.result?.weight);
+```
 
 ## Proposer cooldown and active proposal limit
 
