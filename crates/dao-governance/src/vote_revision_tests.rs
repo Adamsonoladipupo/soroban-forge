@@ -15,9 +15,7 @@
 //! - revision_count increments on every successful revision.
 //! - A fresh vote has a zero revision count.
 
-use crate::{
-    DaoGovernance, DataKey, ProposalState, SorobanForgeDaoGovernanceClient, VoteReceipt,
-};
+use crate::{DaoGovernance, DataKey, ProposalState, SorobanForgeDaoGovernanceClient, VoteReceipt};
 use soroban_forge_shared_utils::ForgeError;
 use soroban_forge_test_utils::{MockTarget, TestAccounts};
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};

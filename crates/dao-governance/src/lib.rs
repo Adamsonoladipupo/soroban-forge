@@ -334,6 +334,18 @@ pub trait SorobanForgeDaoGovernance {
         voter: Address,
     ) -> Result<VoteReceipt, soroban_forge_shared_utils::ForgeError>;
 
+    /// How many times `voter` revised their vote on `proposal_id` via
+    /// `revise_vote` (0 if never revised or never voted).
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — `proposal_id` does not exist.
+    fn get_vote_revision_count(
+        env: Env,
+        proposal_id: u64,
+        voter: Address,
+    ) -> Result<u32, soroban_forge_shared_utils::ForgeError>;
+
     /// Read the proposal-level snapshot metadata (snapshot ledger sequence and
     /// ledger timestamp recorded when the proposal was created).
     ///

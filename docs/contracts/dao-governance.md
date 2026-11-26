@@ -26,6 +26,7 @@ fn get_proposal_count() -> u64
 fn get_proposals(offset, limit) -> Result<Vec<Proposal>, ForgeError>
 fn has_voted(proposal_id, voter) -> Result<bool, ForgeError>
 fn get_vote_receipt(proposal_id, voter) -> Result<VoteReceipt, ForgeError>
+fn get_vote_revision_count(proposal_id, voter) -> Result<u32, ForgeError>
 fn get_active_proposal_count(proposer) -> u32
 fn touch_ttl(proposal_id) -> Result<(), ForgeError>
 ```
