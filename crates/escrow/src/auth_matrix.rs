@@ -497,7 +497,7 @@ fn matrix_deposit_unrelated_rejected() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn matrix_release_seller_success_auth_tree() {
+fn matrix_release_buyer_success_auth_tree() {
     let (env, token, tc, contract_id, client, buyer, seller, arbiter, _) = setup!();
     let id = client.create_escrow(&buyer, &seller, &arbiter, &token, &AMOUNT, &TIMEOUT);
     client.deposit(&id);
@@ -506,7 +506,7 @@ fn matrix_release_seller_success_auth_tree() {
     assert_eq!(
         env.auths(),
         [(
-            seller.clone(),
+            buyer.clone(),
             AuthorizedInvocation {
                 function: AuthorizedFunction::Contract((
                     contract_id.clone(),
@@ -523,7 +523,7 @@ fn matrix_release_seller_success_auth_tree() {
 }
 
 #[test]
-fn matrix_release_buyer_rejected_snapshot_unchanged() {
+fn matrix_release_seller_rejected_snapshot_unchanged() {
     let (env, token, tc, contract_id, client, buyer, seller, arbiter, _) = setup!();
     let id = client.create_escrow(&buyer, &seller, &arbiter, &token, &AMOUNT, &TIMEOUT);
     client.deposit(&id);
@@ -531,7 +531,7 @@ fn matrix_release_buyer_rejected_snapshot_unchanged() {
     let status = client.get_status(&id);
     let events = env.events().all().events().len();
     env.mock_auths(&[MockAuth {
-        address: &buyer,
+        address: &seller,
         invoke: &MockAuthInvoke {
             contract: &contract_id,
             fn_name: "release",
@@ -585,7 +585,7 @@ fn matrix_release_unrelated_rejected() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn matrix_release_partial_seller_success_auth_tree() {
+fn matrix_release_partial_buyer_success_auth_tree() {
     let (env, token, tc, contract_id, client, buyer, seller, arbiter, _) = setup!();
     let id = client.create_escrow(&buyer, &seller, &arbiter, &token, &AMOUNT, &TIMEOUT);
     client.deposit(&id);
@@ -595,7 +595,7 @@ fn matrix_release_partial_seller_success_auth_tree() {
     assert_eq!(
         env.auths(),
         [(
-            seller.clone(),
+            buyer.clone(),
             AuthorizedInvocation {
                 function: AuthorizedFunction::Contract((
                     contract_id.clone(),
@@ -612,7 +612,7 @@ fn matrix_release_partial_seller_success_auth_tree() {
 }
 
 #[test]
-fn matrix_release_partial_buyer_rejected_snapshot_unchanged() {
+fn matrix_release_partial_seller_rejected_snapshot_unchanged() {
     let (env, token, tc, contract_id, client, buyer, seller, arbiter, _) = setup!();
     let id = client.create_escrow(&buyer, &seller, &arbiter, &token, &AMOUNT, &TIMEOUT);
     client.deposit(&id);
@@ -621,7 +621,7 @@ fn matrix_release_partial_buyer_rejected_snapshot_unchanged() {
     let status = client.get_status(&id);
     let events = env.events().all().events().len();
     env.mock_auths(&[MockAuth {
-        address: &buyer,
+        address: &seller,
         invoke: &MockAuthInvoke {
             contract: &contract_id,
             fn_name: "release_partial",
@@ -1399,7 +1399,7 @@ fn matrix_deposit_basket_partial_leg_auth_rejected_no_partial_custody() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn matrix_release_basket_seller_success_auth_tree() {
+fn matrix_release_basket_buyer_success_auth_tree() {
     let (env, token_a, token_b, tc_a, tc_b, contract_id, client, buyer, seller, arbiter, _) =
         setup_basket!();
     let assets = basket_assets(&env, &token_a, &token_b);
@@ -1410,7 +1410,7 @@ fn matrix_release_basket_seller_success_auth_tree() {
     assert_eq!(
         env.auths(),
         [(
-            seller.clone(),
+            buyer.clone(),
             AuthorizedInvocation {
                 function: AuthorizedFunction::Contract((
                     contract_id.clone(),
@@ -1429,7 +1429,7 @@ fn matrix_release_basket_seller_success_auth_tree() {
 }
 
 #[test]
-fn matrix_release_basket_buyer_rejected_snapshot_unchanged() {
+fn matrix_release_basket_seller_rejected_snapshot_unchanged() {
     let (env, token_a, token_b, tc_a, tc_b, contract_id, client, buyer, seller, arbiter, _) =
         setup_basket!();
     let assets = basket_assets(&env, &token_a, &token_b);
@@ -1440,7 +1440,7 @@ fn matrix_release_basket_buyer_rejected_snapshot_unchanged() {
     let status = client.get_status(&id);
     let events = env.events().all().events().len();
     env.mock_auths(&[MockAuth {
-        address: &buyer,
+        address: &seller,
         invoke: &MockAuthInvoke {
             contract: &contract_id,
             fn_name: "release_basket",
@@ -1479,7 +1479,7 @@ fn matrix_release_basket_arbiter_rejected() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn matrix_release_partial_basket_seller_success_auth_tree() {
+fn matrix_release_partial_basket_buyer_success_auth_tree() {
     let (env, token_a, token_b, tc_a, tc_b, contract_id, client, buyer, seller, arbiter, _) =
         setup_basket!();
     let assets = basket_assets(&env, &token_a, &token_b);
@@ -1491,7 +1491,7 @@ fn matrix_release_partial_basket_seller_success_auth_tree() {
     assert_eq!(
         env.auths(),
         [(
-            seller.clone(),
+            buyer.clone(),
             AuthorizedInvocation {
                 function: AuthorizedFunction::Contract((
                     contract_id.clone(),
@@ -1509,7 +1509,7 @@ fn matrix_release_partial_basket_seller_success_auth_tree() {
 }
 
 #[test]
-fn matrix_release_partial_basket_buyer_rejected() {
+fn matrix_release_partial_basket_seller_rejected() {
     let (env, token_a, token_b, tc_a, _tc_b, contract_id, client, buyer, seller, arbiter, _) =
         setup_basket!();
     let assets = basket_assets(&env, &token_a, &token_b);
@@ -1517,7 +1517,7 @@ fn matrix_release_partial_basket_buyer_rejected() {
     client.deposit_basket(&id);
     let partial = AMOUNT / 2;
     env.mock_auths(&[MockAuth {
-        address: &buyer,
+        address: &seller,
         invoke: &MockAuthInvoke {
             contract: &contract_id,
             fn_name: "release_partial_basket",
