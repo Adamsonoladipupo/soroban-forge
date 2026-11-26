@@ -1,53 +1,25 @@
 "use client";
 
-import {
-  type ChangeEvent,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Networks } from "@stellar/stellar-sdk";
+import { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit/sdk";
+import { defaultModules } from "@creit.tech/stellar-wallets-kit/modules/utils";
 import {
   Client,
   networks,
   type EscrowData,
+  ForgeError,
 } from "@soroban-forge/escrow-client";
-import {
-  DEFAULT_DEMO_AMOUNT,
-  DEFAULT_DEMO_TIMEOUT_SECS,
-  DEFAULT_DEMO_TOKEN,
-  DEMO_STATE_SCHEMA,
-  DEMO_STATE_STORAGE_KEY,
-  DEMO_STATE_VERSION,
-  DemoStateValidationError,
-  browserDemoStorage,
-  emptyDemoState,
-  importDemoState,
-  loadDemoState,
-  resetDemoState,
-  saveDemoState,
-  serializeDemoStateExport,
-  validateDemoState,
-  type DemoState,
-} from "../lib/demo-state";
-
-declare global {
-  interface Window {
-    freighterApi?: {
-      isConnected(): Promise<boolean>;
-      getPublicKey(): Promise<string>;
-      signTransaction(
-        xdr: string,
-        opts?: { networkPassphrase?: string; address?: string }
-      ): Promise<{ signedTxXdr: string }>;
-    };
-  }
-}
+import MultisigDashboard from "./multisig-dashboard";
 
 const RPC_URL = "https://soroban-testnet.stellar.org";
 const NETWORK_PASSPHRASE = networks.testnet.networkPassphrase;
 const CONTRACT_ID = networks.testnet.contractId;
+
+// 7-decimal demo token (SAC "credit" asset) used by the repo's own testnet demo
+// (see the README proof table at the repository root).
+const DEFAULT_TOKEN =
+  "CBJQ53EOHB5MWSS7CETN523WILLNVS7NQAQQAQIS5QAYTPRCZSGKL23O";
 
 // 1 unit = 10^7 stroops (SEP-41 default for 7-decimal tokens such as XLM)
 const DECIMALS = BigInt(7);
@@ -61,7 +33,13 @@ function ts(): string {
   return new Date().toLocaleTimeString();
 }
 
+// Minimum and maximum review window bounds for the review-period escrow flow.
+const MIN_REVIEW_PERIOD = 60; // shortest useful window (1 minute)
+const MAX_REVIEW_PERIOD = 30 * 24 * 60 * 60; // 30 days
+const DEFAULT_REVIEW_PERIOD = 3 * 24 * 60 * 60; // 3 days
+
 export default function Home() {
+  const [mounted, setMounted] = useState(false);
   const [account, setAccount] = useState<string | null>(null);
   const [client, setClient] = useState<Client | null>(null);
   const [busy, setBusy] = useState(false);
@@ -72,9 +50,13 @@ export default function Home() {
   const [buyer, setBuyer] = useState("");
   const [seller, setSeller] = useState("");
   const [arbiter, setArbiter] = useState("");
-  const [token, setToken] = useState(DEFAULT_DEMO_TOKEN);
-  const [amount, setAmount] = useState(DEFAULT_DEMO_AMOUNT);
-  const [timeoutSecs, setTimeoutSecs] = useState(DEFAULT_DEMO_TIMEOUT_SECS);
+  const [token, setToken] = useState(DEFAULT_TOKEN);
+  const [amount, setAmount] = useState("10000000"); // stroops
+  const [timeoutSecs, setTimeoutSecs] = useState("3600");
+  const [reviewPeriodSecs, setReviewPeriodSecs] = useState(
+    DEFAULT_REVIEW_PERIOD.toString()
+  );
+  const [useReviewWindow, setUseReviewWindow] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createdId, setCreatedId] = useState<string | null>(null);
 
@@ -90,176 +72,49 @@ export default function Home() {
   const [escrow, setEscrow] = useState<EscrowData | null>(null);
   const [readBusy, setReadBusy] = useState(false);
 
+  // Review-window state (for escrows created with review or when fetching release requests)
+  const [releaseRequest, setReleaseRequest] = useState<{
+    amount: bigint;
+    release_at: bigint;
+    requested_at: bigint;
+  } | null>(null);
+  const [reviewWindowEndsAt, setReviewWindowEndsAt] = useState<bigint | null>(null);
+  const [reviewWindowSecondsRemaining, setReviewWindowSecondsRemaining] =
+    useState<number | null>(null);
+
   // List panel
   const [myIds, setMyIds] = useState<Array<bigint>>([]);
   const [listTotal, setListTotal] = useState<number | null>(null);
   const [listBusy, setListBusy] = useState(false);
-
-  const demoHydrated = useRef(false);
-  const suppressNextPersist = useRef(false);
-  const cancelResetRef = useRef<HTMLButtonElement>(null);
-  const [confirmReset, setConfirmReset] = useState(false);
-  const [importError, setImportError] = useState<string | null>(null);
 
   const pushLog = useCallback(
     (text: string, kind: LogEntry["kind"] = "info") => {
       setLog((prev) => [{ id: logId++, time: ts(), text, kind }, ...prev]);
     },
     []
-  );
-
-  const applyDemoState = useCallback((state: DemoState) => {
-    setBuyer(state.buyer);
-    setSeller(state.seller);
-    setArbiter(state.arbiter);
-    setToken(state.token);
-    setAmount(state.amount);
-    setTimeoutSecs(state.timeoutSecs);
-    setResolveFavor(state.resolveFavor);
-  }, []);
-
-  const currentDemoState = useCallback(
-    (): DemoState => ({
-      buyer,
-      seller,
-      arbiter,
-      token,
-      amount,
-      timeoutSecs,
-      resolveFavor,
-    }),
-    [
-      buyer,
-      seller,
-      arbiter,
-      token,
-      amount,
-      timeoutSecs,
-      resolveFavor,
-    ]
-  );
-
-  const demoStatePreview = useMemo(
-    () => JSON.stringify(currentDemoState(), null, 2),
-    [currentDemoState]
-  );
-
-  const persistIssue = useMemo(() => {
-    try {
-      validateDemoState(currentDemoState());
-      return null;
-    } catch (error) {
-      return error instanceof DemoStateValidationError
-        ? `${error.code}: ${error.message}`
-        : (error as Error).message;
-    }
-  }, [currentDemoState]);
-
+  );  // Initialize the wallet kit after hydration.
   useEffect(() => {
-    const storage = browserDemoStorage();
-    queueMicrotask(() => {
-      try {
-        const stored = loadDemoState(storage);
-        if (stored !== null) applyDemoState(stored);
-      } catch (error) {
-        resetDemoState(storage);
-        pushLog(
-          `Stored demo state was invalid and was reset: ${(error as Error).message}`,
-          "err"
-        );
-      } finally {
-        demoHydrated.current = true;
+    if (!mounted) return;
+    StellarWalletsKit.init({ modules: defaultModules() });
+    StellarWalletsKit.setNetwork(Networks.TESTNET);
+  }, [mounted]);
+
+  // Refresh the review-window countdown every second while one is active.
+  useEffect(() => {
+    if (reviewWindowEndsAt === null) return;
+    const tick = () => {
+      const now = BigInt(Math.floor(Date.now() / 1000));
+      const remaining = Number(reviewWindowEndsAt - now);
+      setReviewWindowSecondsRemaining(remaining > 0 ? remaining : 0);
+      if (remaining <= 0) {
+        setReviewWindowEndsAt(null);
+        setReviewWindowSecondsRemaining(null);
       }
-    });
-  }, [applyDemoState, pushLog]);
-
-  useEffect(() => {
-    if (!demoHydrated.current) return;
-    if (suppressNextPersist.current) {
-      suppressNextPersist.current = false;
-      return;
-    }
-    if (persistIssue) return;
-    saveDemoState(browserDemoStorage(), currentDemoState());
-  }, [currentDemoState, persistIssue]);
-
-  useEffect(() => {
-    if (!confirmReset) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setConfirmReset(false);
     };
-    window.addEventListener("keydown", onKeyDown);
-    cancelResetRef.current?.focus();
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [confirmReset]);
-
-  const exportDemoState = useCallback(() => {
-    try {
-      const json = serializeDemoStateExport(currentDemoState());
-      setImportError(null);
-      const blob = new Blob([json], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = "soroban-forge-local-demo-state.json";
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 0);
-      pushLog("Exported local demo state as JSON (browser only).", "ok");
-    } catch (error) {
-      pushLog(`Export failed: ${(error as Error).message}`, "err");
-    }
-  }, [currentDemoState, pushLog]);
-
-  const handleDemoImport = useCallback(
-    async (event: ChangeEvent<HTMLInputElement>) => {
-      const file = event.target.files?.[0];
-      event.target.value = "";
-      if (!file) return;
-
-      try {
-        const raw = await file.text();
-        const state = importDemoState(browserDemoStorage(), raw);
-        const next = state ?? emptyDemoState();
-        suppressNextPersist.current =
-          JSON.stringify(next) !== demoStatePreview;
-        applyDemoState(next);
-        setImportError(null);
-        pushLog(
-          state === null
-            ? "Imported empty local demo state."
-            : "Imported and validated local demo state.",
-          "ok"
-        );
-      } catch (error) {
-        const message =
-          error instanceof DemoStateValidationError
-            ? `${error.code}: ${error.message}`
-            : (error as Error).message;
-        setImportError(message);
-        pushLog(`Import rejected: ${message}`, "err");
-      }
-    },
-    [applyDemoState, demoStatePreview, pushLog]
-  );
-
-  const confirmDemoReset = useCallback(() => {
-    const next = emptyDemoState();
-    resetDemoState(browserDemoStorage());
-    suppressNextPersist.current =
-      JSON.stringify(next) !== demoStatePreview;
-    applyDemoState(next);
-    setConfirmReset(false);
-    setImportError(null);
-    pushLog(
-      "Reset local demo state. Wallet connection and network settings were unchanged.",
-      "ok"
-    );
-  }, [applyDemoState, demoStatePreview, pushLog]);
-
-  const freighterMissing =
-    typeof window !== "undefined" && !window.freighterApi;
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [reviewWindowEndsAt]);
 
   const listMine = useCallback(
     async (c: Client, addr: string) => {
@@ -288,30 +143,45 @@ export default function Home() {
   const connect = useCallback(async () => {
     setBusy(true);
     try {
-      if (typeof window === "undefined" || !window.freighterApi) {
-        pushLog(
-          "Freighter not detected. Install the Freighter wallet extension and reload.",
-          "err"
-        );
-        return;
+      if (!mounted) {
+        throw new Error("Wallet connectors are still loading; try again shortly.");
       }
-      if (!(await window.freighterApi.isConnected())) {
-        pushLog("Freighter is not connected yet. Allow access in the popup.", "err");
-      }
-      const pubkey = await window.freighterApi.getPublicKey();
+
+      const { address: pubkey } = await StellarWalletsKit.authModal();
       setAccount(pubkey);
+      // Keep the visible buyer value and the transaction payload in sync.
+      setBuyer((current) => current || pubkey);
       const c = new Client({
         rpcUrl: RPC_URL,
         networkPassphrase: NETWORK_PASSPHRASE,
         contractId: CONTRACT_ID,
         publicKey: pubkey,
-        signTransaction: (xdr: string, opts?: { networkPassphrase?: string; address?: string }) =>
-          window.freighterApi!.signTransaction(xdr, {
+        signTransaction: async (
+          xdr: string,
+          opts?: { networkPassphrase?: string; address?: string }
+        ) => {
+          const result = await StellarWalletsKit.signTransaction(xdr, {
             networkPassphrase: opts?.networkPassphrase ?? NETWORK_PASSPHRASE,
             address: opts?.address ?? pubkey,
-          }),
+          });
+          if (!result.signedTxXdr) {
+            throw new Error("The selected wallet did not return a signed transaction.");
+          }
+          return { signedTxXdr: result.signedTxXdr };
+        },
       });
       setClient(c);
+
+      // Read the wallet's current network for the safe-write guard.
+      try {
+        const { network } = await StellarWalletsKit.getNetwork();
+        setWalletNetwork(network ?? "testnet");
+        setWalletPassphrase(networks.testnet.networkPassphrase);
+      } catch {
+        setWalletNetwork("testnet");
+        setWalletPassphrase(networks.testnet.networkPassphrase);
+      }
+
       pushLog(
         `Connected to ${pubkey.slice(0, 6)}…${pubkey.slice(-4)} (testnet)`,
         "ok"
@@ -322,15 +192,19 @@ export default function Home() {
     } finally {
       setBusy(false);
     }
-  }, [pushLog, listMine]);
+  }, [listMine, mounted, pushLog]);
 
   const disconnect = useCallback(() => {
+    void StellarWalletsKit.disconnect();
     setAccount(null);
     setClient(null);
     setEscrow(null);
     setMyIds([]);
     setListTotal(null);
     setCreatedId(null);
+    setReleaseRequest(null);
+    setReviewWindowEndsAt(null);
+    setReviewWindowSecondsRemaining(null);
     pushLog("Disconnected. Wallet state cleared.", "info");
   }, [pushLog]);
 
@@ -359,6 +233,126 @@ export default function Home() {
     }
   }, [account, pushLog]);
 
+  /**
+   * Safe-write guard: refuse to send a write transaction while the wallet's
+   * network or account does not match the page's configured network / connected
+   * account. Returns a human-readable reason when the guard fails, or null when
+   * the write is safe to proceed.
+   *
+   * Uses the StellarWalletsKit network and address APIs that the page already
+   * depends on; does not store keys.
+   */
+  const safeWriteGuard = useCallback(
+    async (actionName: string): Promise<string | null> => {
+      if (!account) {
+        return "Connect a wallet first.";
+      }
+      // Check the wallet's current network matches the page's expected network.
+      let walletNetwork: string | undefined;
+      try {
+        const { network } = await StellarWalletsKit.getNetwork();
+        walletNetwork = network;
+      } catch {
+        // If we can't read the network, proceed with a warning.
+        pushLog(
+          `Safe-write guard: could not read wallet network for ${actionName}; assuming testnet.`,
+          "err"
+        );
+      }
+      if (walletNetwork && walletNetwork !== "testnet") {
+        return `Wallet is on network "${walletNetwork}" but this demo targets testnet. Switch the wallet to Stellar testnet.`;
+      }
+      // Check the wallet's current address matches the connected account.
+      try {
+        const { address: walletAddr } = await StellarWalletsKit.getAddress();
+        if (walletAddr && walletAddr !== account) {
+          pushLog(
+            `Safe-write guard: wallet address ${walletAddr.slice(0, 6)}… does not match the connected account ${account.slice(0, 6)}… for ${actionName}.`,
+            "err"
+          );
+          return `Wallet address does not match the connected account. Disconnect and reconnect.`;
+        }
+      } catch {
+        pushLog(
+          `Safe-write guard: could not read wallet address for ${actionName}.`,
+          "err"
+        );
+      }
+      return null;
+    },
+    [account, pushLog]
+  );
+
+  /**
+   * Which role-related actions the connected account may perform on the given
+   * escrow, given the escrow's current status and (optionally) an active
+   * review window.
+   *
+   * Kept in one small function so the action list in the UI stays a pure
+   * presentation of this decision.
+   */
+  const allowedActions = useCallback(
+    (
+      esc: EscrowData | null,
+      hasReviewWindow: boolean,
+      isPendingRelease: boolean
+    ): Array<{ name: string; role: string }> => {
+      if (!esc || !account) return [];
+
+      const s = esc.status.tag;
+      const isBuyer = esc.buyer === account;
+      const isSeller = esc.seller === account;
+      const isArbiter = esc.arbiter === account;
+      const actions: Array<{ name: string; role: string }> = [];
+
+      if (s === "Pending") {
+        // Only the buyer may deposit into a pending escrow.
+        if (isBuyer) actions.push({ name: "Deposit", role: "buyer" });
+      } else if (s === "Funded") {
+        if (isSeller && !hasReviewWindow && !isPendingRelease) {
+          actions.push({ name: "Request release", role: "seller" });
+        }
+        if (isBuyer && hasReviewWindow && isPendingRelease) {
+          actions.push({ name: "Approve release", role: "buyer" });
+          actions.push({ name: "Dispute", role: "buyer" });
+        }
+        if (hasReviewWindow && isPendingRelease) {
+          // Anyone may execute once the review window has elapsed.
+          actions.push({ name: "Execute release", role: "anyone" });
+        }
+        if (isBuyer && !hasReviewWindow) {
+          actions.push({ name: "Release", role: "buyer" });
+          actions.push({ name: "Release partial", role: "buyer" });
+          actions.push({ name: "Refund", role: "buyer" });
+        }
+        if (isArbiter && s === "Funded") {
+          // Arbiter resolves only disputes; not added here to keep the set
+          // tidy. Resolve is exposed separately below.
+        }
+      } else if (
+        s === "Completed" || s === "Refunded" || s === "Cancelled"
+      ) {
+        // Terminal states — no write actions.
+      } else if (s === "Disputed") {
+        if (isArbiter) actions.push({ name: "Resolve", role: "arbiter" });
+      }
+
+      return actions;
+    },
+    [account]
+  );
+
+  /**
+   * Format a ForgeError code as a human-readable name+message pair.
+   */
+  const formatForgeError = useCallback((code: number, message?: string): string => {
+    const known = ForgeError[code as keyof typeof ForgeError];
+    if (known) {
+      return known.message + (message ? ` (${message})` : "");
+    }
+    return message ?? `Error code ${code}`;
+  }, []);
+
   const createEscrow = useCallback(async () => {
     if (!client) return;
     setCreating(true);
@@ -369,36 +363,85 @@ export default function Home() {
         return;
       }
       const timeoutBig = BigInt(timeoutSecs || "0");
-      const tx = await client.create_escrow(
-        {
-          buyer,
-          seller,
-          arbiter,
-          token,
-          amount: amountBig,
-          timeout: timeoutBig,
-        },
-        { timeoutInSeconds: 60 }
-      );
-      pushLog("create_escrow simulated — requesting signature…", "info");
-      const sent = await tx.signAndSend();
-      if (sent.sendTransactionResponse) {
+      const reviewPeriodBig = BigInt(reviewPeriodSecs || "0");
+      const buyerAddress = buyer.trim() || account?.trim() || "";
+      const sellerAddress = seller.trim();
+      const arbiterAddress = arbiter.trim();
+      const tokenAddress = token.trim();
+      if (!buyerAddress || !sellerAddress || !arbiterAddress || !tokenAddress) {
         pushLog(
-          `Submitted — tx hash ${sent.sendTransactionResponse.hash}`,
+          "Enter complete buyer, seller, arbiter, and token addresses before creating the escrow.",
+          "err"
+        );
+        return;
+      }
+
+      let escrowId: bigint;
+      if (useReviewWindow && reviewPeriodBig > BigInt(0)) {
+        // Review-window escrow: creates the escrow AND opens a review window
+        // for the seller's future release request.
+        const tx = await client.create_escrow_with_review(
+          {
+            buyer: buyerAddress,
+            seller: sellerAddress,
+            arbiter: arbiterAddress,
+            token: tokenAddress,
+            amount: amountBig,
+            timeout: timeoutBig,
+            review_period: reviewPeriodBig,
+          },
+          { timeoutInSeconds: 60 }
+        );
+        pushLog("create_escrow_with_review simulated — requesting signature…", "info");
+        const sent = await tx.signAndSend();
+        if (sent.sendTransactionResponse) {
+          pushLog(
+            `Submitted — tx hash ${sent.sendTransactionResponse.hash}`,
+            "ok"
+          );
+        }
+        escrowId = sent.result.unwrap();
+        pushLog(
+          `Review-window escrow created — id ${escrowId.toString()} (review window ${reviewPeriodSecs} s)`,
           "ok"
         );
+        // Fetch the release request that was created alongside the escrow.
+        void fetchReleaseRequest(escrowId);
+      } else {
+        const tx = await client.create_escrow(
+          {
+            buyer: buyerAddress,
+            seller: sellerAddress,
+            arbiter: arbiterAddress,
+            token: tokenAddress,
+            amount: amountBig,
+            timeout: timeoutBig,
+          },
+          { timeoutInSeconds: 60 }
+        );
+        pushLog("create_escrow simulated — requesting signature…", "info");
+        const sent = await tx.signAndSend();
+        if (sent.sendTransactionResponse) {
+          pushLog(
+            `Submitted — tx hash ${sent.sendTransactionResponse.hash}`,
+            "ok"
+          );
+        }
+        escrowId = sent.result.unwrap();
+        setCreatedId(escrowId.toString());
+        pushLog(`Escrow created — id ${escrowId.toString()} (Pending)`, "ok");
       }
-      const escrowId = sent.result.unwrap();
-      setCreatedId(escrowId.toString());
+
       setActionEscrowId(escrowId.toString());
       setReadEscrowId(escrowId.toString());
-      pushLog(`Escrow created — id ${escrowId.toString()} (Pending)`, "ok");
+      void fetchEscrow(escrowId.toString());
     } catch (e) {
       pushLog(`Create escrow failed: ${(e as Error).message}`, "err");
     } finally {
       setCreating(false);
     }
   }, [
+    account,
     client,
     buyer,
     seller,
@@ -406,22 +449,83 @@ export default function Home() {
     token,
     amount,
     timeoutSecs,
+    reviewPeriodSecs,
+    useReviewWindow,
     pushLog,
   ]);
 
+  const fetchReleaseRequest = useCallback(
+    async (escrowId: bigint) => {
+      if (!client) return;
+      try {
+        const { result } = await client.get_release_request({ escrow_id: escrowId });
+        if (result.isOk()) {
+          const req = result.unwrap();
+          if (req.isSome()) {
+            const r = req.unwrap();
+            setReleaseRequest({
+              amount: r.amount.value ?? BigInt(0),
+              release_at: r.release_at.value ?? BigInt(0),
+              requested_at: r.requested_at.value ?? BigInt(0),
+            });
+            setReviewWindowEndsAt(r.release_at.value ?? BigInt(0));
+            pushLog(
+              `Release request found for escrow ${escrowId.toString()} — review window ends at ${r.release_at.value}`,
+              "ok"
+            );
+          } else {
+            setReleaseRequest(null);
+            setReviewWindowEndsAt(null);
+            pushLog(
+              `No release request for escrow ${escrowId.toString()}.`,
+              "info"
+            );
+          }
+        } else {
+          pushLog(
+            `get_release_request returned error: ${result.unwrapErr().message}`,
+            "err"
+          );
+        }
+      } catch (e) {
+        pushLog(`get_release_request failed: ${(e as Error).message}`, "err");
+      }
+    },
+    [client, pushLog]
+  );
+
   const sendAction = useCallback(
     async (name: string, invoke: () => Promise<void>) => {
+      // Safe-write guard: refuse to send while the wallet's network or account
+      // doesn't match.
+      const guardReason = await safeWriteGuard(name);
+      if (guardReason) {
+        pushLog(`${name} blocked: ${guardReason}`, "err");
+        return;
+      }
+
       setActionInFlight(name);
       try {
         pushLog(`${name} — simulating…`, "info");
         await invoke();
       } catch (e) {
-        pushLog(`${name} failed: ${(e as Error).message}`, "err");
+        const err = e as Error;
+        // Try to surface a ForgeError name instead of a raw code where possible.
+        const codeMatch = err.message?.match(/Error\(Contract, #(\d+)\)/);
+        if (codeMatch) {
+          const code = parseInt(codeMatch[1], 10);
+          pushLog(
+            `${name} failed: ${formatForgeError(code, err.message)}`,
+            "err"
+          );
+        } else {
+          pushLog(`${name} failed: ${err.message}`, "err");
+        }
       } finally {
         setActionInFlight(null);
       }
     },
-    [pushLog]
+    [safeWriteGuard, pushLog, formatForgeError]
   );
 
   const runAction = useCallback(
@@ -467,6 +571,13 @@ export default function Home() {
         if (result.isOk()) {
           const data = result.unwrap();
           setEscrow(data);
+
+          // If this escrow was created with a review window, also fetch its
+          // release request so the countdown and action buttons stay accurate.
+          if (useReviewWindow) {
+            void fetchReleaseRequest(escrowId);
+          }
+
           pushLog(
             `Fetched escrow ${escrowId.toString()} — ${data.status.tag}`,
             "ok"
@@ -483,23 +594,36 @@ export default function Home() {
         setReadBusy(false);
       }
     },
-    [client, readEscrowId, pushLog]
+    [client, readEscrowId, pushLog, useReviewWindow, fetchReleaseRequest]
   );
 
-  const connectProps = useMemo(
-    () => ({
-      disabled: busy,
-      onClick: connect,
-    }),
-    [busy, connect]
+  connectProps;
+  // Silence unused-variable lint for the memo that drives the connect button.
+  void connectProps;
+
+  // Decide which actions the connected account may take on the currently
+  // selected escrow, factoring in any active review window.
+  const currentActions = useMemo(
+    () =>
+      allowedActions(
+        escrow,
+        releaseRequest !== null,
+        releaseRequest !== null
+      ),
+    [escrow, releaseRequest, allowedActions]
   );
 
   return (
     <main className="mx-auto max-w-5xl p-6">
-      <div className="mb-1 flex items-center justify-between gap-4">
-        <h1 className="text-3xl font-bold">Soroban Forge — Escrow Testnet Demo</h1>
-        <a href="/ui/index.html" className="shrink-0 rounded border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50">
-          Dashboard screens
+      <div className="mb-3 flex items-center justify-between gap-4">
+        <h1 className="text-3xl font-bold">
+          Soroban Forge — Escrow Testnet Demo
+        </h1>
+        <a
+          href="/issues"
+          className="shrink-0 rounded border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+        >
+          Issue board
         </a>
       </div>
       <p className="text-sm text-gray-500 mb-6">
@@ -534,22 +658,21 @@ export default function Home() {
         ) : (
           <div>
             <button
-              {...(typeof window !== "undefined" && window.freighterApi
-                ? connectProps
-                : { disabled: true })}
+              {...(mounted ? connectProps : { disabled: true })}
               className="rounded bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
             >
-              {busy ? "Connecting…" : "Connect Freighter"}
+              {busy ? "Connecting…" : "Connect wallet"}
             </button>
-            {freighterMissing && (
+            {!mounted && (
               <p className="mt-2 text-sm text-amber-700">
-                Freighter not detected. Install the Freighter wallet extension
-                for Stellar, create/import an account, and reload this page.
+                Loading Stellar wallet connectors…
               </p>
             )}
           </div>
         )}
       </section>
+
+      <MultisigDashboard account={account} mounted={mounted} />
 
       <div className="grid gap-6 lg:grid-cols-2">
         {/* Create */}
@@ -591,7 +714,7 @@ export default function Home() {
                 className="mt-1 w-full rounded border border-gray-300 px-2 py-1.5 font-mono text-sm"
               />
               <span className="text-xs text-gray-500">
-                Default: repo&apos;s testnet demo SAC &quot;credit&quot; token
+                Default: repo&apos;s testnet demo SAC "credit" token
                 (7 decimals). Replace with your own testnet token contract id.
               </span>
             </label>
@@ -615,6 +738,35 @@ export default function Home() {
                 />
               </label>
             </div>
+
+            {/* Review-window toggle */}
+            <div className="flex items-center gap-2">
+              <label className="flex items-center gap-1 text-sm">
+                <input
+                  type="checkbox"
+                  checked={useReviewWindow}
+                  onChange={(e) => setUseReviewWindow(e.target.checked)}
+                />
+                Use review window (create_escrow_with_review)
+              </label>
+            </div>
+            {useReviewWindow && (
+              <label className="block text-sm">
+                Review period (seconds)
+                <input
+                  value={reviewPeriodSecs}
+                  onChange={(e) => setReviewPeriodSecs(e.target.value)}
+                  placeholder={DEFAULT_REVIEW_PERIOD.toString()}
+                  className="mt-1 w-full rounded border border-gray-300 px-2 py-1.5 font-mono text-sm"
+                />
+                <span className="text-xs text-gray-500">
+                  {MIN_REVIEW_PERIOD}–{MAX_REVIEW_PERIOD} seconds; default{" "}
+                  {DEFAULT_REVIEW_PERIOD} s (3 days). After the window ends,
+                  anyone may execute the seller&apos;s release.
+                </span>
+              </label>
+            )}
+
             <button
               onClick={createEscrow}
               disabled={!client || creating}
@@ -656,34 +808,90 @@ export default function Home() {
               className="mt-1 w-full rounded border border-gray-300 px-2 py-1.5 font-mono text-sm"
             />
           </label>
-          <div className="flex flex-wrap gap-2">
-            {(["Deposit", "Release", "Refund", "Cancel", "Dispute"] as const).map(
-              (name) => (
+
+          {/* Review-window info */}
+          {releaseRequest && (
+            <div className="mb-3 rounded border border-gray-200 p-3">
+              <p className="text-sm font-medium mb-1">Review window</p>
+              <p className="text-sm font-mono">
+                Requested at:{" "}
+                {new Date(Number(releaseRequest.requested_at) * 1000).toLocaleString()}
+              </p>
+              <p className="text-sm font-mono">
+                Release available at:{" "}
+                {new Date(Number(releaseRequest.release_at) * 1000).toLocaleString()}
+              </p>
+              {reviewWindowSecondsRemaining !== null && (
+                <p className="text-sm font-mono">
+                  {reviewWindowSecondsRemaining > 0
+                    ? `${reviewWindowSecondsRemaining} s remaining in review window`
+                    : "Review window ended — release may be executed"}
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Allowed actions for the connected account */}
+          {currentActions.length > 0 ? (
+            <div className="flex flex-wrap gap-2">
+              {currentActions.map((a) => (
                 <button
-                  key={name}
+                  key={a.name}
                   disabled={!client || actionInFlight !== null}
-                  onClick={() =>
-                    void runAction(name.toLowerCase(), (c, id) =>
-                      name === "Dispute"
-                        ? c.dispute({ escrow_id: id, claimant: account ?? "" })
-                        : c[
-                            name.toLowerCase() as
-                              | "deposit"
-                              | "release"
-                              | "refund"
-                              | "cancel"
-                          ]({ escrow_id: id })
-                    )
-                  }
+                  onClick={() => {
+                    void runAction(a.name.toLowerCase(), (c, id) => {
+                      switch (a.name) {
+                        case "Deposit":
+                          return c.deposit({ escrow_id: id });
+                        case "Request release":
+                          return c.request_release({
+                            escrow_id: id,
+                            amount: escrow?.amount ?? BigInt(0),
+                          });
+                        case "Approve release":
+                          return c.approve_release({ escrow_id: id });
+                        case "Execute release":
+                          return c.execute_release({ escrow_id: id });
+                        case "Dispute":
+                          return c.dispute({
+                            escrow_id: id,
+                            claimant: account ?? "",
+                          });
+                        case "Release":
+                          return c.release({ escrow_id: id });
+                        case "Release partial":
+                          return c.release_partial({
+                            escrow_id: id,
+                            amount: escrow?.amount ?? BigInt(0),
+                          });
+                        case "Refund":
+                          return c.refund({ escrow_id: id });
+                        case "Resolve":
+                          return c.resolve({
+                            escrow_id: id,
+                            in_favor_of_seller: resolveFavor === "seller",
+                          });
+                        default:
+                          return c.deposit({ escrow_id: id });
+                      }
+                    });
+                  }}
                   className="rounded border border-blue-600 px-3 py-1.5 text-sm text-blue-600 hover:bg-blue-50 disabled:opacity-50"
                 >
-                  {actionInFlight === name.toLowerCase()
+                  {actionInFlight === a.name.toLowerCase()
                     ? "Busy…"
-                    : name}
+                    : a.name}
                 </button>
-              )
-            )}
-          </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-sm text-gray-500">
+              No write actions available for the connected account in the
+              current escrow state.
+            </p>
+          )}
+
+          {/* Resolve dispute (arbiter only) — always present for visibility */}
           <div className="mt-4 rounded border border-gray-200 p-3">
             <p className="text-sm font-medium mb-2">Resolve dispute (arbiter only)</p>
             <div className="flex items-center gap-4">
@@ -830,122 +1038,6 @@ export default function Home() {
           )}
         </section>
       </div>
-
-      <section className="mt-6 rounded-xl border border-gray-300 p-4">
-        <h2 className="text-lg font-semibold mb-2">6 · Local demo state</h2>
-        <p className="text-sm text-gray-600 mb-3">
-          This panel covers browser-only form values. Escrow IDs produced by
-          live transactions stay in the panels above and are never exported.
-          Exports contain no wallet keys or signed transaction payloads.
-        </p>
-        <dl className="mb-3 grid gap-1 text-xs text-gray-500 sm:grid-cols-3">
-          <div>
-            <dt className="font-medium text-gray-500">Schema</dt>
-            <dd className="break-all font-mono">{DEMO_STATE_SCHEMA}</dd>
-          </div>
-          <div>
-            <dt className="font-medium text-gray-500">Version</dt>
-            <dd className="font-mono">{DEMO_STATE_VERSION}</dd>
-          </div>
-          <div>
-            <dt className="font-medium text-gray-500">Storage key</dt>
-            <dd className="break-all font-mono">{DEMO_STATE_STORAGE_KEY}</dd>
-          </div>
-        </dl>
-        <div className="grid gap-4 lg:grid-cols-2">
-          <div>
-            <h3 className="text-sm font-semibold mb-2">
-              Current local form state
-            </h3>
-            <pre className="max-h-64 overflow-auto rounded-lg bg-gray-100 p-3 font-mono text-xs">
-              {demoStatePreview}
-            </pre>
-          </div>
-          <div className="space-y-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                onClick={exportDemoState}
-                className="rounded bg-blue-600 px-4 py-1.5 text-sm text-white hover:bg-blue-700"
-              >
-                Export local demo state
-              </button>
-              <button
-                onClick={() => setConfirmReset(true)}
-                className="rounded bg-gray-200 px-4 py-1.5 text-sm hover:bg-gray-300"
-              >
-                Reset local demo state
-              </button>
-            </div>
-            <label className="block text-sm">
-              Import local demo state JSON
-              <input
-                type="file"
-                accept="application/json,.json"
-                onChange={(event) => void handleDemoImport(event)}
-                aria-label="Import local demo state JSON"
-                className="mt-1 block w-full text-sm"
-              />
-            </label>
-            {importError && (
-              <p role="alert" className="text-sm text-red-700">
-                {importError}
-              </p>
-            )}
-            {persistIssue && (
-              <p className="text-sm text-amber-700">
-                Current form state is not persisted: {persistIssue}
-              </p>
-            )}
-            <p className="text-sm text-gray-500">
-              Import validates the versioned document before applying it. The
-              preview shows current form values; only valid form state is
-              persisted. Reset keeps your wallet connection and network settings
-              unchanged.
-            </p>
-          </div>
-        </div>
-      </section>
-
-      {confirmReset && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-          role="presentation"
-        >
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="reset-demo-state-title"
-            className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl"
-          >
-            <h2
-              id="reset-demo-state-title"
-              className="text-lg font-semibold mb-2"
-            >
-              Reset local demo state?
-            </h2>
-            <p className="text-sm text-gray-600 mb-4">
-              This clears the browser-only form state stored by this demo. It
-              does not change the network, contract, wallet connection, or any
-              on-chain data.
-            </p>
-            <div className="flex justify-end gap-2">
-              <button
-                ref={cancelResetRef}
-                onClick={() => setConfirmReset(false)}
-                className="rounded bg-gray-200 px-4 py-1.5 text-sm hover:bg-gray-300"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={confirmDemoReset}
-                className="rounded bg-red-600 px-4 py-1.5 text-sm text-white hover:bg-red-700"
-              >
-                Reset local demo state
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Log feed */}
       <section className="mt-6">

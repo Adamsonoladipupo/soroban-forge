@@ -94,7 +94,16 @@ export function emptyDemoState(): DemoState {
 export function browserDemoStorage(): DemoStorage | null {
   if (typeof window === "undefined") return null;
   try {
-    return window.localStorage;
+    const storage = window.localStorage;
+    if (
+      storage &&
+      typeof storage.getItem === "function" &&
+      typeof storage.setItem === "function" &&
+      typeof storage.removeItem === "function"
+    ) {
+      return storage;
+    }
+    return null;
   } catch {
     return null;
   }

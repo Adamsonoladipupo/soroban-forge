@@ -16,7 +16,7 @@ import {
   serializeDemoStateExport,
   type DemoState,
   type DemoStorage,
-} from "../lib/demo-state";
+} from "../lib/demo-state.ts";
 
 class MemoryStorage implements DemoStorage {
   private readonly values = new Map<string, string>();

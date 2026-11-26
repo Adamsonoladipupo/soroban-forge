@@ -9,6 +9,15 @@ merges a pull request once it is approved, green and clean. It was added after
 the October 2026 incident described in [SECURITY.md](../SECURITY.md#repository-hygiene),
 where malicious code entered `main` through two merged pull requests.
 
+> **Auto-merge is currently off (scan-only mode).** ForgeGuard still scans
+> every PR, publishes `ForgeGuard / malware-scan` and posts its comment, but it
+> never merges: a maintainer merges by hand. Merges made with `GITHUB_TOKEN`
+> are attributed to `github-actions` and do not close the PR's linked issues
+> (`Closes #N`), so Drips never saw the issue as completed and contributors had
+> to be credited manually. Re-enable with `FORGEGUARD_AUTO_MERGE: "1"` in
+> `.github/workflows/forgeguard.yml`, only with a merge token that closes
+> issues.
+
 ## When ForgeGuard merges
 
 A pull request is merged only when **all** of these hold:
@@ -71,6 +80,14 @@ listing the findings, and updates it in place on later runs.
 `.github/workflows/forgeguard.yml` runs when CI completes on a pull request,
 every 30 minutes (to pick up approvals), and on demand from the Actions tab.
 The manual run takes an optional PR number and a dry-run switch.
+right after a maintainer approves one, every 30 minutes as a backstop, and on
+demand from the Actions tab. The manual run takes an optional PR number and a
+dry-run switch.
+
+Approvals reach ForgeGuard through `.github/workflows/forgeguard-trigger.yml`.
+A `pull_request_review` run only gets a read-only token on fork pull requests,
+so that workflow has no permissions and does nothing but finish; ForgeGuard
+picks it up via `workflow_run` and runs from the default branch as usual.
 
 The job checks out the **default branch** and runs the scanner from there. Pull
 request heads are fetched as git objects (`refs/pull/N/head`) and only read with
@@ -97,6 +114,8 @@ access to the repository.
 
 ## Known limitations
 
+- Merges made with `GITHUB_TOKEN` do not close linked issues, so Drips does not
+  credit the contributor. This is why auto-merge is off (see above).
 - Merges made with `GITHUB_TOKEN` do not trigger further workflows, so CI does
   not re-run on the base branch after a ForgeGuard merge. Switch the workflow to
   a GitHub App token if that matters.
